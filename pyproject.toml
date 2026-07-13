@@ -1,0 +1,18 @@
+[project]
+name = "langchain-deep-agent"
+version = "1.0.0"
+description = "DeepAgent Harness - Enterprise Custom Multi-Agent Coding System"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "langchain>=0.3.0",
+    "langchain-groq>=1.1.3",
+    "langgraph>=0.2.0",
+    "langgraph-checkpoint-sqlite>=2.0.0",
+    "python-dotenv>=1.2.2",
+    "streamlit>=1.38.0",
+    "duckduckgo-search>=6.0.0",
+    "beautifulsoup4>=4.12.0",
+    "aiosqlite>=0.20.0",
+    "pydantic>=2.0.0"
+]
