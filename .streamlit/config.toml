@@ -1,0 +1,40 @@
+# DeepAgent Harness 全局主题：深色石板 + 靛蓝强调，配合 styles.py 的玻璃拟态组件
+[theme]
+base = "dark"
+primaryColor = "#6366f1"
+backgroundColor = "#0b1120"
+secondaryBackgroundColor = "#131c31"
+textColor = "#e2e8f0"
+linkColor = "#818cf8"
+borderColor = "#243147"
+codeBackgroundColor = "#0f172a"
+codeTextColor = "#cbd5e1"
+showWidgetBorder = true
+showSidebarBorder = false
+baseRadius = "10px"
+buttonRadius = "8px"
+
+redColor = "#f87171"
+orangeColor = "#fb923c"
+yellowColor = "#fbbf24"
+greenColor = "#34d399"
+blueColor = "#60a5fa"
+violetColor = "#a78bfa"
+grayColor = "#94a3b8"
+
+font = "Outfit:https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap"
+headingFont = "Outfit:https://fonts.googleapis.com/css2?family=Outfit:wght@500;600;700&display=swap"
+codeFont = "'JetBrains Mono':https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap"
+baseFontSize = 15
+codeFontSize = "13px"
+headingFontWeights = [700, 600, 600, 600, 500, 500]
+
+[theme.sidebar]
+backgroundColor = "#0a101d"
+secondaryBackgroundColor = "#131c31"
+borderColor = "#1e293b"
+textColor = "#e2e8f0"
+primaryColor = "#818cf8"
+
+[browser]
+gatherUsageStats = false

@@ -1,0 +1,19 @@
+# 密钥与本地配置
+.env
+
+# 运行时数据（数据库、对话归档、MCP/A2A 配置、导出文件）
+deepagent_data/
+
+# 项目工作区：模型生成代码的沙盒目录（各项目产出）
+sandbox/
+
+# 调试日志
+ui_debug.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.coverage
