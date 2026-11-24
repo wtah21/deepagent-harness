@@ -267,12 +267,11 @@ class ProjectStore:
 
 
 class WorkspaceStore:
-    """每个 project 一个工作区：文件实体落本地 sandbox 目录，数据库只留元数据。
+    """每个 project 一个工作区：文件实体直接落本地 sandbox 目录，数据库不存文件元数据。
 
     sandbox/<项目名>_<thread_id前8位>/ 就是工作区的物理位置，
     同时是该项目 Docker 容器的挂载源（容器内 /app/workspace）。
-    旧版「SQLite 存内容 + 模块级长连接 + 写穿缓存 + 全局锁」的逻辑已全部移除：
-    文件读写直接走操作系统，元数据为低频短连接访问。
+    文件读写直接走操作系统，文件一览按需扫描目录。
     """
 
     # thread_id -> 目录名 的进程内缓存，避免热路径反复查项目表
