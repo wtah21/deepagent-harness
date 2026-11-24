@@ -3,8 +3,10 @@ DeepAgent Harness 所有可用工具的中央注册表。
 每个工具都带有元数据：名称、描述、分类、风险等级。
 AgentFactory 借助它把工具名字符串解析为实际的工具函数。
 """
+import functools
 from typing import Callable, Any
 
+from approval import needs_approval, request as request_approval
 from config import TOOL_CATEGORIES
 from tool_output_guard import wrap_tool
 
@@ -45,6 +47,30 @@ class ToolMeta:
 TOOL_REGISTRY: dict[str, ToolMeta] = {}
 
 
+def _with_approval(tool: Any) -> Any:
+    """给高危工具加人工审核：真正执行前阻塞等待用户在界面上放行。"""
+    if not needs_approval(tool.name):
+        return tool
+    original = getattr(tool, "func", None)
+    if original is None or getattr(original, "__tool_approval_guarded__", False):
+        return tool
+
+    @functools.wraps(original)
+    def guarded(*args, **kwargs):
+        arguments = dict(kwargs)
+        if args:
+            arguments["args"] = args
+        if not request_approval(tool.name, arguments):
+            return (
+                f"Tool call `{tool.name}` was rejected by the user. "
+                "Do not retry it silently; explain why it was needed and ask for an alternative approach."
+            )
+        return original(*args, **kwargs)
+
+    setattr(guarded, "__tool_approval_guarded__", True)
+    return tool.model_copy(update={"func": guarded})
+
+
 def register_tool(
     func: Callable,
     name: str,
@@ -52,8 +78,9 @@ def register_tool(
     category: str,
     risk_level: str = "safe",
 ) -> None:
-    """将工具注册到全局注册表中；统一套一层超长输出守卫。"""
-    TOOL_REGISTRY[name] = ToolMeta(wrap_tool(func), name, description, category, risk_level)
+    """将工具注册到全局注册表中：先做输出守卫，再套一层高危操作审核。"""
+    guarded = _with_approval(wrap_tool(func))
+    TOOL_REGISTRY[name] = ToolMeta(guarded, name, description, category, risk_level)
 
 
 def unregister_tool(name: str) -> None:
@@ -92,27 +119,23 @@ def _register_all_tools() -> None:
     from tools import (
         write_todos, ls, read_file, write_file, edit_file,
         execute_python, read_from_disk,
-        web_search, read_url, shell_command, diff_files,
+        shell_command, diff_files,
         install_package,
     )
 
     # ── 文件系统工具 ─────────────────────────────────────────────────
-    register_tool(ls, "ls", "List all files in the virtual filesystem", "filesystem")
-    register_tool(read_file, "read_file", "Read a file from the virtual filesystem", "filesystem")
-    register_tool(write_file, "write_file", "Create or overwrite a virtual file", "filesystem")
-    register_tool(edit_file, "edit_file", "Replace a substring in an existing virtual file", "filesystem")
+    register_tool(ls, "ls", "List all files in the workspace", "filesystem")
+    register_tool(read_file, "read_file", "Read a file from the workspace", "filesystem")
+    register_tool(write_file, "write_file", "Create or overwrite a workspace file", "filesystem")
+    register_tool(edit_file, "edit_file", "Replace a substring in an existing workspace file", "filesystem")
     # save_to_disk 已移除：agent 不得直写本地文件系统，导出一律走 UI「导入到本地」按钮
-    register_tool(read_from_disk, "read_from_disk", "Import a real file into the virtual filesystem", "filesystem", "moderate")
-    register_tool(diff_files, "diff_files", "Show unified diff between two virtual files", "filesystem")
+    register_tool(read_from_disk, "read_from_disk", "Import a real file into the workspace", "filesystem", "moderate")
+    register_tool(diff_files, "diff_files", "Show unified diff between two workspace files", "filesystem")
 
     # ── 代码执行工具 ─────────────────────────────────────────────────
     register_tool(execute_python, "execute_python", "Run Python code in an isolated subprocess", "execution", "moderate")
     register_tool(shell_command, "shell_command", "Run a shell command (sandboxed)", "execution", "dangerous")
     register_tool(install_package, "install_package", "Install a Python package via pip", "execution", "dangerous")
-
-    # ── 网络工具 ─────────────────────────────────────────────────────
-    register_tool(web_search, "web_search", "Search the web via DuckDuckGo (free, no API key)", "web")
-    register_tool(read_url, "read_url", "Fetch and extract text content from a URL", "web")
 
     # ── 规划工具 ─────────────────────────────────────────────────────
     register_tool(write_todos, "write_todos", "Create or update the task plan", "planning")

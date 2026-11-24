@@ -151,7 +151,7 @@ def validate_harness_config(config: dict) -> tuple[dict, list[str]]:
     stages: list[dict] = []
     if not isinstance(stages_raw, list) or not stages_raw:
         errors.append("stages 必须是非空列表，每个元素形如 "
-                      '{"agent_name": "...", "instructions": "...", "pass_files": true}')
+                      '{"agent_name": "...", "instructions": "...", "description": "..."}')
     else:
         for i, raw in enumerate(stages_raw):
             if not isinstance(raw, dict):
@@ -169,7 +169,6 @@ def validate_harness_config(config: dict) -> tuple[dict, list[str]]:
             stages.append({
                 "agent_name": agent_name,
                 "instructions": instructions,
-                "pass_files": bool(raw.get("pass_files", True)),
                 # 节点职责：给 UI 的流程图做说明，缺省时留空串
                 "description": str(raw.get("description", "")).strip(),
             })

@@ -2,7 +2,7 @@
 工具输出治理：超长工具结果在进入模型上下文之前先压缩。
 
 预算：单个工具结果超过 TOOL_OUTPUT_TOKEN_BUDGET 时触发。分页类工具应在
-参数层先控制返回量（ls / read_file / web_search 等已支持），这里只做兜底。
+参数层先控制返回量（ls / read_file 等已支持），这里只做兜底。
 
 路由：把工具名、调用参数、用户当前目标与结果前 TOOL_OUTPUT_JEV_SAMPLE_CHARS
 个字符交给 JEV（TypeSafe System One，choice 问题）判断压缩方式：

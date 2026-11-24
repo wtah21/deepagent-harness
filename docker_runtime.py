@@ -10,10 +10,14 @@ DeepAgent Harness 的 Docker 隔离执行运行时。
   产物不需要额外拷贝，由 persistence.WorkspaceStore.sync_dir 回收元数据；
 - 所有 Docker 调用失败都抛 DockerError（不静默），由调用方决定是否回退本地沙盒。
 """
+import hashlib
 import subprocess
+import threading
 from pathlib import Path
 
-from config import CONTAINER_PREFIX, DOCKER_CPUS, DOCKER_IMAGE, DOCKER_MEMORY
+from config import (
+    CONTAINER_PREFIX, DOCKER_CPUS, DOCKER_IMAGE, DOCKER_MEMORY, DOCKER_NETWORK,
+)
 from persistence import WorkspaceStore
 
 # 容器内固定的工作目录 / 挂载点
@@ -23,6 +27,7 @@ CONTAINER_WORKDIR = "/app/workspace"
 # 避免常驻容器在应用关闭后继续驻留内存
 LABEL_MANAGED = "harness.managed=true"  # 标识「由本项目管理」的容器
 LABEL_PROJECT = "harness.project"       # 值为项目目录名，标识容器归属的项目
+LABEL_CONFIG = "harness.config"         # 启动参数指纹，参数变化时自动重建容器
 
 
 class DockerError(RuntimeError):
@@ -72,21 +77,66 @@ def _ensure_image() -> None:
         raise DockerError(f"拉取镜像 {DOCKER_IMAGE} 失败：{pull.stderr.strip()[:300]}")
 
 
+def _config_fingerprint(workspace_id: str) -> str:
+    """容器启动参数指纹：镜像 / 资源 / 网络 / 只读策略 / 挂载源变化时用于重建旧容器。"""
+    raw = "|".join([
+        DOCKER_IMAGE, DOCKER_CPUS, DOCKER_MEMORY, DOCKER_NETWORK,
+        "rootfs-readonly", _mount_spec(workspace_id),
+    ])
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def _inspect_state(name: str) -> tuple[bool, str] | None:
+    """返回 (是否运行中, 配置指纹)；容器不存在时返回 None。"""
+    result = _docker(
+        ["inspect", "-f",
+         '{{.State.Running}}|{{index .Config.Labels "harness.config"}}', name],
+        timeout=15,
+    )
+    if result.returncode != 0:
+        return None
+    running, _, fingerprint = (result.stdout or "").strip().partition("|")
+    return running == "true", fingerprint
+
+
+# 容器创建锁：并行分支会同时首次触发建容器，同名 docker run 会互相冲突，
+# 按工作区串行化「检查/创建」这一段，已存在的容器仍可并发 exec。
+_container_locks: dict[str, threading.Lock] = {}
+_container_locks_guard = threading.Lock()
+
+
+def _container_lock(workspace_id: str) -> threading.Lock:
+    with _container_locks_guard:
+        return _container_locks.setdefault(workspace_id, threading.Lock())
+
+
 def get_or_create_container(workspace_id: str) -> str:
+    """获取或创建该项目的常驻容器，返回容器名（并发调用按工作区串行化）。"""
+    with _container_lock(workspace_id):
+        return _get_or_create_container(workspace_id)
+
+
+def _get_or_create_container(workspace_id: str) -> str:
     """获取或创建该项目的常驻容器，返回容器名。
 
     已存在且运行中 → 直接返回；已存在但停止 → docker start；
-    不存在 → 按规格创建（1 CPU / 1GB 内存 / 挂载工作区 / 工作目录 /app/workspace）。
+    启动参数（网络 / 只读 / 挂载源）与当前配置不一致 → 删除后按新规格重建；
+    不存在 → 按规格创建（1 CPU / 1GB 内存 / 断网 / 只读根文件系统 / 挂载工作区）。
     """
     name = container_name(workspace_id)
-    inspect = _docker(["inspect", "-f", "{{.State.Running}}", name], timeout=15)
-    if inspect.returncode == 0:
-        if inspect.stdout.strip() == "true":
+    fingerprint = _config_fingerprint(workspace_id)
+    state = _inspect_state(name)
+    if state is not None:
+        running, existing = state
+        if existing == fingerprint:
+            if running:
+                return name
+            start = _docker(["start", name], timeout=60)
+            if start.returncode != 0:
+                raise DockerError(f"启动容器 {name} 失败：{start.stderr.strip()[:300]}")
             return name
-        start = _docker(["start", name], timeout=60)
-        if start.returncode != 0:
-            raise DockerError(f"启动容器 {name} 失败：{start.stderr.strip()[:300]}")
-        return name
+        # 参数变了（例如绑定了新的外部工作目录）：旧容器作废，下面按新参数重建
+        _docker(["rm", "-f", name], timeout=60)
 
     _ensure_image()
     run = _docker(
@@ -97,6 +147,13 @@ def get_or_create_container(workspace_id: str) -> str:
             "-m", DOCKER_MEMORY,
             "--label", LABEL_MANAGED,
             "--label", f"{LABEL_PROJECT}={WorkspaceStore.dir_name_of(workspace_id)}",
+            "--label", f"{LABEL_CONFIG}={fingerprint}",
+            # 强制断网：容器内代码无法访问外部网络
+            "--network", DOCKER_NETWORK,
+            # 根文件系统只读：只有挂载进来的工作区可写，其余目录只能读
+            "--read-only",
+            "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+            "-e", "HOME=/tmp",
             "-v", _mount_spec(workspace_id),
             "-w", CONTAINER_WORKDIR,
             "-e", "PYTHONUNBUFFERED=1",
@@ -198,8 +255,8 @@ _cleanup_registered = False
 def register_exit_cleanup() -> None:
     """注册进程退出钩子：应用退出时停止本项目所有常驻容器，避免内存泄漏。
 
-    只在 Streamlit 主进程入口调用；parallel_worker 子进程虽 import 本模块，
-    但不注册钩子，避免子进程结束时误停主进程正在使用的容器。重复调用幂等。
+    只在 Streamlit 主进程入口调用；并行分支只会在主进程的线程池里执行，
+    不会另起子进程，因此这里只需注册一次。重复调用幂等。
     """
     global _cleanup_registered
     if _cleanup_registered:

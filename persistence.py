@@ -6,14 +6,17 @@ DeepAgent Harness 的持久化模块。
 """
 import json
 import mimetypes
+import os
 import re
 import sqlite3
+import threading
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from config import DB_PATH, SANDBOX_DIR
+from config import DB_PATH, FILE_LOCK_TIMEOUT, SANDBOX_DIR
 
 
 def _get_connection() -> sqlite3.Connection:
@@ -47,21 +50,10 @@ def init_db():
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
             thread_id TEXT NOT NULL,
-            files_json TEXT DEFAULT '{}',
+            workspace_path TEXT DEFAULT '',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS file_metadata (
-            id TEXT PRIMARY KEY,
-            task_id TEXT NOT NULL,
-            file_name TEXT NOT NULL,
-            file_path TEXT NOT NULL,
-            file_size INTEGER NOT NULL,
-            mime_type TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            UNIQUE (task_id, file_path)
-        );
-        CREATE INDEX IF NOT EXISTS idx_file_metadata_task ON file_metadata (task_id);
         CREATE TABLE IF NOT EXISTS project_messages (
             message_id TEXT PRIMARY KEY,
             workspace_id TEXT NOT NULL,
@@ -85,6 +77,17 @@ def init_db():
     if "channel" not in columns:
         conn.execute("ALTER TABLE project_messages ADD COLUMN channel TEXT DEFAULT 'main'")
         conn.commit()
+    # 项目可绑定用户指定的本地工作目录，空字符串表示使用默认 sandbox 目录
+    project_columns = {row["name"] for row in conn.execute("PRAGMA table_info(projects)")}
+    if "workspace_path" not in project_columns:
+        conn.execute("ALTER TABLE projects ADD COLUMN workspace_path TEXT DEFAULT ''")
+        conn.commit()
+    # 文件实体统一落本地工作区目录：旧版的文件元数据表与项目内文件索引不再使用。
+    # 老库里的 files_json 列保留（SQLite 删列代价高），内容清空即可。
+    conn.execute("DROP TABLE IF EXISTS file_metadata")
+    if "files_json" in project_columns:
+        conn.execute("UPDATE projects SET files_json = '{}'")
+    conn.commit()
     conn.close()
 
 
@@ -96,80 +99,6 @@ def _sanitize_name(name: str) -> str:
     """把项目名清洗成安全的目录名。"""
     cleaned = re.sub(r'[\\/:*?"<>|\s]+', "-", str(name or "")).strip("-.")
     return cleaned[:40] or "project"
-
-
-# ── 文件元数据表 CRUD ────────────────────────────────────────────────
-
-def upsert_file_meta(task_id: str, rel_path: str, size: int) -> dict:
-    """登记/刷新一条文件元数据，返回该记录的完整字段。"""
-    conn = _get_connection()
-    try:
-        row = conn.execute(
-            "SELECT id, created_at FROM file_metadata WHERE task_id = ? AND file_path = ?",
-            (task_id, rel_path),
-        ).fetchone()
-        mime = mimetypes.guess_type(rel_path)[0] or "text/plain"
-        if row:
-            conn.execute(
-                "UPDATE file_metadata SET file_size = ?, mime_type = ? WHERE id = ?",
-                (size, mime, row["id"]),
-            )
-            record = {
-                "id": row["id"], "task_id": task_id,
-                "file_name": Path(rel_path).name, "file_path": rel_path,
-                "file_size": size, "mime_type": mime, "created_at": row["created_at"],
-            }
-        else:
-            record = {
-                "id": f"file_{uuid.uuid4().hex[:10]}", "task_id": task_id,
-                "file_name": Path(rel_path).name, "file_path": rel_path,
-                "file_size": size, "mime_type": mime, "created_at": _utc_now(),
-            }
-            conn.execute(
-                "INSERT INTO file_metadata (id, task_id, file_name, file_path, file_size, mime_type, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (record["id"], record["task_id"], record["file_name"], record["file_path"],
-                 record["file_size"], record["mime_type"], record["created_at"]),
-            )
-        conn.commit()
-        return record
-    finally:
-        conn.close()
-
-
-def delete_file_meta(task_id: str, rel_path: str) -> bool:
-    conn = _get_connection()
-    try:
-        cursor = conn.execute(
-            "DELETE FROM file_metadata WHERE task_id = ? AND file_path = ?",
-            (task_id, rel_path),
-        )
-        conn.commit()
-        return cursor.rowcount > 0
-    finally:
-        conn.close()
-
-
-def list_file_meta(task_id: str) -> list[dict]:
-    conn = _get_connection()
-    try:
-        rows = conn.execute(
-            "SELECT * FROM file_metadata WHERE task_id = ? ORDER BY file_path",
-            (task_id,),
-        ).fetchall()
-        return [dict(r) for r in rows]
-    finally:
-        conn.close()
-
-
-def delete_file_meta_by_task(task_id: str) -> int:
-    conn = _get_connection()
-    try:
-        cursor = conn.execute("DELETE FROM file_metadata WHERE task_id = ?", (task_id,))
-        conn.commit()
-        return cursor.rowcount
-    finally:
-        conn.close()
 
 
 class AgentStore:
@@ -261,15 +190,24 @@ class ProjectStore:
     """项目会话的增删改查（CRUD）操作。"""
 
     @staticmethod
-    def save(project_id: str, name: str, thread_id: str, files: Optional[dict] = None) -> None:
+    def save(
+        project_id: str,
+        name: str,
+        thread_id: str,
+        workspace_path: Optional[str] = None,
+    ) -> None:
+        """保存项目档案。workspace_path 为 None 时保留原值，传空串表示恢复默认沙盒目录。
+
+        文件不再入库：项目只记录名称、线程与绑定的工作目录，文件实体都在目录里。
+        """
         conn = _get_connection()
         now = _utc_now()
-        files_json = json.dumps(files or {})
         conn.execute(
-            "INSERT INTO projects (id, name, thread_id, files_json, created_at, updated_at) "
+            "INSERT INTO projects (id, name, thread_id, workspace_path, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(id) DO UPDATE SET name=excluded.name, files_json=excluded.files_json, updated_at=excluded.updated_at",
-            (project_id, name, thread_id, files_json, now, now),
+            "ON CONFLICT(id) DO UPDATE SET name=excluded.name, "
+            "workspace_path=COALESCE(?, workspace_path), updated_at=excluded.updated_at",
+            (project_id, name, thread_id, workspace_path or "", now, now, workspace_path),
         )
         conn.commit()
         conn.close()
@@ -283,19 +221,22 @@ class ProjectStore:
             return None
         return {
             "id": row["id"], "name": row["name"], "thread_id": row["thread_id"],
-            "files": json.loads(row["files_json"]),
+            "workspace_path": row["workspace_path"] or "",
             "created_at": row["created_at"], "updated_at": row["updated_at"],
         }
 
     @staticmethod
     def get_by_thread(thread_id: str) -> Optional[dict]:
-        """按线程 id 反查项目（用于把工作区定位到 sandbox 目录名）。"""
+        """按线程 id 反查项目（用于把工作区定位到 sandbox 目录名或外部目录）。"""
         conn = _get_connection()
         row = conn.execute("SELECT * FROM projects WHERE thread_id = ?", (thread_id,)).fetchone()
         conn.close()
         if not row:
             return None
-        return {"id": row["id"], "name": row["name"], "thread_id": row["thread_id"]}
+        return {
+            "id": row["id"], "name": row["name"], "thread_id": row["thread_id"],
+            "workspace_path": row["workspace_path"] or "",
+        }
 
     @staticmethod
     def list_all() -> list[dict]:
@@ -304,7 +245,7 @@ class ProjectStore:
         conn.close()
         return [
             {"id": r["id"], "name": r["name"], "thread_id": r["thread_id"],
-             "files": json.loads(r["files_json"]),
+             "workspace_path": r["workspace_path"] or "",
              "created_at": r["created_at"], "updated_at": r["updated_at"]}
             for r in rows
         ]
@@ -328,7 +269,7 @@ class ProjectStore:
 class WorkspaceStore:
     """每个 project 一个工作区：文件实体落本地 sandbox 目录，数据库只留元数据。
 
-    sandbox/<项目名>_<thread_id前8位>/ 就是虚拟文件系统的物理位置，
+    sandbox/<项目名>_<thread_id前8位>/ 就是工作区的物理位置，
     同时是该项目 Docker 容器的挂载源（容器内 /app/workspace）。
     旧版「SQLite 存内容 + 模块级长连接 + 写穿缓存 + 全局锁」的逻辑已全部移除：
     文件读写直接走操作系统，元数据为低频短连接访问。
@@ -336,35 +277,82 @@ class WorkspaceStore:
 
     # thread_id -> 目录名 的进程内缓存，避免热路径反复查项目表
     _dir_cache: dict[str, str] = {}
-    # thread_id -> 外部临时工作区目录。并行子智能体在独立进程里把工作区
-    # 重定向到自己的沙盒目录，从而隔离多个子任务对同一文件的并发修改。
-    _sandbox_roots: dict[str, Path] = {}
+    # thread_id -> 项目绑定的外部工作目录（None 表示使用默认 sandbox 目录）。
+    # 外部目录是用户自己的文件，agent 直接读写原目录，不做拷贝。
+    _external_dirs: dict[str, Optional[Path]] = {}
 
     @classmethod
-    def bind_sandbox_root(cls, workspace_id: str, root: str | Path) -> Path:
-        """把某个工作区临时重定向到外部目录（仅当前进程生效）。"""
-        path = Path(root)
-        path.mkdir(parents=True, exist_ok=True)
-        cls._sandbox_roots[workspace_id] = path
+    def external_dir_of(cls, workspace_id: str) -> Optional[Path]:
+        """项目绑定的外部工作目录；未绑定、或绑定后目录已不可用时返回 None。"""
+        if workspace_id in cls._external_dirs:
+            return cls._external_dirs[workspace_id]
+        project = ProjectStore.get_by_thread(workspace_id)
+        raw = (project or {}).get("workspace_path") or ""
+        path = Path(raw).expanduser() if raw else None
+        resolved = path.resolve() if (path and path.is_dir()) else None
+        cls._external_dirs[workspace_id] = resolved
+        return resolved
+
+    @classmethod
+    def bind_external_dir(cls, workspace_id: str, root: str | Path) -> Path:
+        """把项目工作区指向外部目录（仅更新进程内缓存，持久化由调用方写项目表）。"""
+        path = Path(root).expanduser().resolve()
+        cls._external_dirs[workspace_id] = path
         return path
 
     @classmethod
-    def unbind_sandbox_root(cls, workspace_id: str) -> None:
-        """解除外部目录绑定，恢复按 sandbox/<项目> 读写。"""
-        cls._sandbox_roots.pop(workspace_id, None)
+    def unbind_external_dir(cls, workspace_id: str) -> None:
+        """解除外部目录绑定，恢复默认 sandbox 工作区（持久化由调用方清空项目表字段）。"""
+        cls._external_dirs[workspace_id] = None
+
+    @staticmethod
+    def validate_external_dir(raw: str) -> tuple[Optional[Path], str]:
+        """校验用户填写的工作目录，返回 (绝对路径, 错误信息)。"""
+        text = str(raw or "").strip()
+        if not text:
+            return None, "请填写目录路径。"
+        path = Path(text).expanduser()
+        if not path.is_absolute():
+            return None, "需要填写绝对路径（例如 D:\\\\projects\\\\demo）。"
+        if not path.exists():
+            return None, "目录不存在。"
+        if not path.is_dir():
+            return None, "该路径不是目录。"
+        if not os.access(path, os.R_OK):
+            return None, "目录不可读，请检查权限。"
+        return path.resolve(), ""
+
+    # 文件写锁：并行分支共享同一工作区，按 (workspace, 相对路径) 粒度串行化写入。
+    # 不同文件的写入互不阻塞，同一文件的 read-modify-write 不会互相覆盖。
+    _file_locks: dict[str, threading.RLock] = {}
+    _file_locks_guard = threading.Lock()
 
     @classmethod
-    def is_sandboxed(cls, workspace_id: str) -> bool:
-        """当前工作区是否被重定向到外部沙盒目录。"""
-        return workspace_id in cls._sandbox_roots
+    def _file_lock(cls, workspace_id: str, rel_path: str) -> threading.RLock:
+        """取某个文件的进程内可重入锁（首次访问时创建）。"""
+        key = f"{workspace_id}::{rel_path}"
+        with cls._file_locks_guard:
+            return cls._file_locks.setdefault(key, threading.RLock())
+
+    @classmethod
+    @contextmanager
+    def write_lock(cls, workspace_id: str, path: str, timeout: float = FILE_LOCK_TIMEOUT):
+        """按文件粒度加写锁；等锁超时抛 TimeoutError，由调用方转成可读错误。"""
+        rel = cls.normalize_path(path) or str(path or "")
+        lock = cls._file_lock(workspace_id, rel)
+        if not lock.acquire(timeout=timeout):
+            raise TimeoutError(f"等待文件锁超时（{timeout:.0f}s）：{rel}")
+        try:
+            yield
+        finally:
+            lock.release()
 
     @classmethod
     def workspace_dir(cls, workspace_id: str) -> Path:
-        """定位工作区目录（不存在则创建）。目录名 = 项目名清洗 + thread_id 前 8 位。"""
-        override = cls._sandbox_roots.get(workspace_id)
-        if override is not None:
-            override.mkdir(parents=True, exist_ok=True)
-            return override
+        """定位工作区目录：项目绑定的外部目录 > sandbox/<项目名_线程前8位>。"""
+        external = cls.external_dir_of(workspace_id)
+        if external is not None:
+            return external
         dir_name = cls._dir_cache.get(workspace_id)
         if not dir_name:
             project = ProjectStore.get_by_thread(workspace_id)
@@ -377,15 +365,18 @@ class WorkspaceStore:
 
     @classmethod
     def dir_name_of(cls, workspace_id: str) -> str:
-        override = cls._sandbox_roots.get(workspace_id)
-        if override is not None:
-            return override.name
+        if cls.external_dir_of(workspace_id) is not None:
+            # 外部目录不参与 sandbox 目录命名，用固定前缀保证容器名稳定
+            return f"ext_{workspace_id[:8]}"
         cls.workspace_dir(workspace_id)
         return cls._dir_cache[workspace_id]
 
     @classmethod
     def rename_workspace(cls, workspace_id: str, new_project_name: str) -> None:
         """项目重命名时同步重命名 sandbox 目录，保持目录名可读。"""
+        if cls.external_dir_of(workspace_id) is not None:
+            # 外部工作目录是用户自己的文件夹，名字不随项目改名变化
+            return
         old_dir = cls.workspace_dir(workspace_id)
         new_dir_name = f"{_sanitize_name(new_project_name)}_{workspace_id[:8]}"
         new_dir = SANDBOX_DIR / new_dir_name
@@ -447,73 +438,67 @@ class WorkspaceStore:
 
     @classmethod
     def write(cls, workspace_id: str, path: str, content: str) -> dict:
-        """写入文件实体到 sandbox 目录，并登记元数据。返回该文件的元数据记录。"""
+        """写入文件实体到工作区目录，返回该文件的内存索引条目。
+
+        文件内容与索引都以磁盘为准，不写数据库；写锁按文件粒度生效，
+        并行分支写同一路径时串行执行，写不同文件互不阻塞。
+        """
         rel_path = cls.normalize_path(path)
         if not rel_path:
             raise ValueError(f"非法路径：{path}")
         dest = cls.workspace_dir(workspace_id).joinpath(*rel_path.split("/"))
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(content, encoding="utf-8")
-        if cls.is_sandboxed(workspace_id):
-            # 沙盒产物由汇总节点决定是否写回主工作区，这里不登记元数据，避免污染
-            return cls._shadow_entry(rel_path, content)
-        rel = cls._rel_of(workspace_id, rel_path)
-        record = upsert_file_meta(workspace_id, rel, len(content.encode("utf-8")))
-        return cls._entry_of(record)
-
-    @staticmethod
-    def _shadow_entry(path: str, content: str) -> dict:
-        """沙盒模式下构造与 state.files 结构一致的轻量索引条目（不写元数据表）。"""
-        return {
-            "size": len(content.encode("utf-8")),
-            "mime": mimetypes.guess_type(path)[0] or "text/plain",
-            "created_at": _utc_now(),
-        }
+        with cls.write_lock(workspace_id, rel_path):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(content, encoding="utf-8")
+        try:
+            stat = dest.stat()
+            mtime_ns, size = stat.st_mtime_ns, stat.st_size
+        except OSError:
+            mtime_ns, size = 0, len(content.encode("utf-8"))
+        return cls._entry_for(rel_path, mtime_ns, size)
 
     @classmethod
     def delete(cls, workspace_id: str, path: str) -> bool:
-        dest = cls._abs_path(workspace_id, path)
-        if dest is None or not dest.exists():
+        rel = cls.normalize_path(path)
+        if not rel:
             return False
-        try:
-            dest.unlink()
-        except OSError:
-            return False
-        # 顺带清理空父目录
-        parent = dest.parent
-        while parent != cls.workspace_dir(workspace_id):
+        with cls.write_lock(workspace_id, rel):
+            dest = cls._abs_path(workspace_id, rel)
+            if dest is None or not dest.exists():
+                return False
             try:
-                parent.rmdir()
+                dest.unlink()
             except OSError:
-                break
-        if not cls.is_sandboxed(workspace_id):
-            delete_file_meta(workspace_id, cls._rel_of(workspace_id, path))
-        return True
-
-    @classmethod
-    def _rel_of(cls, workspace_id: str, vpath: str) -> str:
-        """虚拟路径 → 元数据表里的 file_path（sandbox/<目录>/<相对路径>）。"""
-        return f"sandbox/{cls.dir_name_of(workspace_id)}/{vpath}"
+                return False
+            # 顺带清理空父目录
+            parent = dest.parent
+            while parent != cls.workspace_dir(workspace_id):
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+            return True
 
     @staticmethod
-    def _entry_of(record: dict) -> dict:
-        """元数据记录 → state.files 索引条目（轻量，不含内容）。"""
+    def _entry_for(path: str, mtime_ns: int, size: int) -> dict:
+        """构造轻量索引条目（不含内容，不落库）。"""
         return {
-            "size": record["file_size"],
-            "mime": record["mime_type"],
-            "created_at": record["created_at"],
+            "size": size,
+            "mime": mimetypes.guess_type(path)[0] or "text/plain",
+            "created_at": datetime.fromtimestamp(
+                mtime_ns / 1_000_000_000, tz=timezone.utc
+            ).isoformat(),
         }
-
     @classmethod
-    def manifest(cls, workspace_id: str) -> dict:
-        """返回 {vpath: {size, mime, created_at}}，用于填进 state。"""
-        dir_name = cls.dir_name_of(workspace_id)
-        prefix = f"sandbox/{dir_name}/"
-        result = {}
-        for record in list_file_meta(workspace_id):
-            if record["file_path"].startswith(prefix):
-                result[record["file_path"][len(prefix):]] = cls._entry_of(record)
-        return result
+    def scan_index(cls, workspace_id: str) -> dict[str, dict]:
+        """扫描工作区目录，返回索引 {path: {size, mime, created_at}}。
+
+        工作区目录与索引都直接来自这里，数据库不再参与。
+        """
+        return {
+            rel: cls._entry_for(rel, mtime_ns, size)
+            for rel, (mtime_ns, size) in cls.scan_dir(workspace_id).items()
+        }
 
     @classmethod
     def read_all(cls, workspace_id: str) -> dict:
@@ -551,44 +536,30 @@ class WorkspaceStore:
 
     @classmethod
     def sync_dir(cls, workspace_id: str, before: Optional[dict] = None) -> tuple[dict, list[str]]:
-        """把目录里的新增/变更文件登记进元数据表。
+        """对比目录前后快照，返回新增/变更的文件索引（纯内存，不写数据库）。
 
-        before 为执行前快照（scan_dir 的返回值）；传 None 时登记全部文件。
+        before 为执行前快照（scan_dir 的返回值）；传 None 时返回全部文件。
         返回 (entries: {vpath: entry}, changed: [vpath])。
         """
         after = cls.scan_dir(workspace_id)
         entries: dict = {}
         changed: list[str] = []
-        sandboxed = cls.is_sandboxed(workspace_id)
-        for rel, (mtime, size) in after.items():
-            if before is not None and before.get(rel) == (mtime, size):
+        for rel, (mtime_ns, size) in after.items():
+            if before is not None and before.get(rel) == (mtime_ns, size):
                 continue  # 未发生变化
-            if sandboxed:
-                # 沙盒模式只回传索引，不写主工作区的元数据表
-                entries[rel] = {
-                    "size": size,
-                    "mime": mimetypes.guess_type(rel)[0] or "text/plain",
-                    "created_at": _utc_now(),
-                }
-            else:
-                record = upsert_file_meta(workspace_id, cls._rel_of(workspace_id, rel), size)
-                entries[rel] = cls._entry_of(record)
+            entries[rel] = cls._entry_for(rel, mtime_ns, size)
             changed.append(rel)
         return entries, changed
 
     @classmethod
-    def import_legacy(cls, workspace_id: str, files: dict) -> dict:
-        """把旧版「state.files 直接存内容」的数据搬进 sandbox 目录，返回新的索引。"""
-        for path, content in (files or {}).items():
-            if isinstance(content, str):
-                cls.write(workspace_id, path, content)
-        return cls.manifest(workspace_id)
-
-    @classmethod
     def delete_workspace(cls, workspace_id: str) -> None:
-        """删除整个工作区：sandbox 目录 + 全部元数据记录。"""
+        """删除整个工作区：绑定了外部目录时只解除绑定，绝不删除用户自己的文件夹。"""
         import shutil
 
+        external = cls.external_dir_of(workspace_id) is not None
+        cls._external_dirs.pop(workspace_id, None)
+        if external:
+            return
         dir_name = cls._dir_cache.pop(workspace_id, None)
         if dir_name is None:
             dir_name = cls.dir_name_of(workspace_id)
@@ -596,7 +567,6 @@ class WorkspaceStore:
         target = SANDBOX_DIR / dir_name
         if target.exists():
             shutil.rmtree(target, ignore_errors=True)
-        delete_file_meta_by_task(workspace_id)
 
 
 def _migrate_legacy_workspace_files() -> None:

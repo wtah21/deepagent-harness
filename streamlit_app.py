@@ -4,10 +4,15 @@ DeepAgent Harness 的 Streamlit 聊天工作区。
 计划跟踪器，以及 harness 流水线执行选择器。
 """
 import json
+import logging
+import os
+import sys
 import threading
 import time
 import traceback
-import uuid
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
 import streamlit as st
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, RemoveMessage
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
@@ -21,7 +26,7 @@ from config import (
 from persistence import ProjectStore, AgentStore, HarnessStore, WorkspaceStore
 from context_manager import repair_tool_call_pairs
 from hitl import ASK_CHOICE
-from message_store import archive_messages, flush as flush_archive, load_messages, delete_messages_by_workspace
+from message_store import archive_messages, flush as flush_archive, load_messages
 from mcp_client import (
     delete_mcp_server, load_and_register, mcp_status, probe_server,
     remove_mcp_server, save_mcp_server, validate_server_config, validate_server_name,
@@ -31,6 +36,7 @@ from a2a_client import (
     status as a2a_status, suggest_agent_name, validate_agent_name,
 )
 import docker_runtime
+import approval
 # 进程退出钩子：应用停止时按标签停止本项目所有常驻容器，避免内存泄漏（幂等）
 docker_runtime.register_exit_cleanup()
 from subagents import AgentFactory
@@ -48,6 +54,52 @@ from components import (
     file_viewer, execution_timeline, harness_pipeline_progress, harness_diagram,
     harness_strategy_meta, agent_icon, MAIN_AGENT_NODE, MAIN_AGENT_ICON,
 )
+
+# ── 运行日志落盘 ──────────────────────────────────────────────────────
+# 桌面模式下 Streamlit 的 stderr 会被窗口吞掉，进程异常退出后拿不到堆栈；
+# 这里把 Streamlit 内部日志与未捕获异常统一写到文件，便于事后定位。
+_RUNTIME_LOG_PATH = Path(__file__).resolve().parent / "deepagent_data" / "streamlit.log"
+
+
+def _setup_runtime_logging() -> None:
+    _RUNTIME_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    root = logging.getLogger()
+    # 脚本每次 rerun 都会重新执行本文件，按文件路径去重，避免重复挂 handler
+    target = os.path.normcase(str(_RUNTIME_LOG_PATH))
+    if not any(
+        isinstance(h, logging.FileHandler)
+        and os.path.normcase(getattr(h, "baseFilename", "")) == target
+        for h in root.handlers
+    ):
+        # 轮转写：崩溃堆栈要长期保留，但不能让单个日志文件无限增长
+        handler = RotatingFileHandler(
+            _RUNTIME_LOG_PATH, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+        handler.setLevel(logging.INFO)
+        root.addHandler(handler)
+    # app_session 的 fragment 提示是 INFO 级，默认不落到文件，这里显式放开；
+    # 不给 root 提级别，避免第三方库的 INFO 日志把文件刷爆
+    logging.getLogger("streamlit").setLevel(logging.INFO)
+
+    def _excepthook(exc_type, exc, tb):
+        logging.getLogger("harness.uncaught").error(
+            "主线程未捕获异常", exc_info=(exc_type, exc, tb))
+        sys.__excepthook__(exc_type, exc, tb)
+
+    def _thread_excepthook(args):
+        # 流水线 / 主智能体都在后台线程跑，这类异常不会进 Streamlit 页面，
+        # 必须单独记录，否则进程消失后无从查起
+        logging.getLogger("harness.uncaught").error(
+            "后台线程 %s 未捕获异常", getattr(args.thread, "name", "?"),
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    sys.excepthook = _excepthook
+    threading.excepthook = _thread_excepthook
+
+
+_setup_runtime_logging()
 
 # 1. Streamlit 页面配置
 st.set_page_config(page_title="DeepAgent Workspace", page_icon="🧠", layout="wide")
@@ -123,7 +175,6 @@ if st.session_state.get("pending_resume") is not None:
 # 当前项目的工作区：即线程 id，文件内容按这个标识分开存放，项目之间互不影响
 workspace_id = st.session_state.thread_id
 
-files = state_values.get("files", {})
 execution_log = state_values.get("execution_log", [])
 # 历史回放以项目数据库里的完整会话为准：上下文压缩会丢弃 state 里的旧消息，
 # 归档表保留的是压缩前的原文。按当前执行模式只取该渠道的那一份。
@@ -132,21 +183,6 @@ if not messages and current_channel == "main" and state_values.get("messages"):
     # 归档表上线前的旧会话：先用检查点历史渲染，并补写一次归档
     messages = state_values.get("messages", [])
     archive_messages(workspace_id, messages, channel="main")
-
-# 旧版把文件内容直接写在 state 与项目记录里，这里把内容搬进工作区表，
-# 之后 state 只留轻量索引（迁移完成后文件条目不再出现字符串内容）。
-legacy_files = dict((ProjectStore.get(st.session_state.project_id) or {}).get("files") or {})
-legacy_files.update(files if isinstance(files, dict) else {})
-if any(isinstance(content, str) for content in legacy_files.values()):
-    files = WorkspaceStore.import_legacy(workspace_id, legacy_files)
-    ProjectStore.save(
-        st.session_state.project_id,
-        st.session_state.project_name,
-        st.session_state.thread_id,
-        files=files,
-    )
-    if snapshot and snapshot.values:
-        get_main_agent().update_state(config, {"files": files}, as_node="agent")
 
 # ── 侧边栏：实时计划与文件管理器 ──────────────────────────────────────
 
@@ -176,49 +212,101 @@ def _parse_json_text(text: str, label: str, expected: type, errors: list) -> obj
         return None
     return value
 
-@st.dialog("删除项目", width="small")
-def _confirm_delete_project() -> None:
-    """删除当前项目的二次确认：文件、对话历史与沙盒目录一并清掉，不可恢复。"""
-    st.warning(
-        f"确定删除项目「{st.session_state.project_name}」吗？\n\n"
-        "该项目的全部文件、对话历史与沙盒目录都会一并删除，且不可恢复。"
-    )
-    col_cancel, col_ok = st.columns(2)
-    if col_cancel.button("取消", width="stretch", key="del-project-cancel"):
-        st.rerun(scope="app")
-    if col_ok.button("确认删除", type="primary", width="stretch", key="del-project-ok"):
-        thread_id = st.session_state.thread_id
-        if active_run(thread_id, channel="main") or active_run(thread_id, channel="harness"):
-            st.error("该项目仍有任务在运行，请先停止执行再删除。")
+
+def _pick_local_directory() -> str:
+    """在本机弹出系统目录选择框（桌面壳运行时可用）；失败时提示手动填写路径。"""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception:
+        st.error("当前环境无法弹出目录选择框（缺少 tkinter），请直接填写绝对路径。")
+        return ""
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        picked = filedialog.askdirectory(title="选择本地项目目录")
+        root.destroy()
+        return picked or ""
+    except Exception as exc:
+        st.error(f"无法打开目录选择框：{exc}。请直接填写绝对路径。")
+        return ""
+
+
+def _bind_workspace_dir(path: str) -> None:
+    """绑定/解绑项目的本地工作目录：持久化 → 重建容器 → 重建文件索引。
+
+    path 为空表示恢复默认 sandbox 目录。外部目录是用户自己的文件夹，
+    只做绑定，不复制也不删除。
+    """
+    thread_id = st.session_state.thread_id
+    project_id = st.session_state.project_id
+    name = st.session_state.project_name
+    if path:
+        ProjectStore.save(project_id, name, thread_id, workspace_path=path)
+        WorkspaceStore.bind_external_dir(thread_id, path)
+    else:
+        ProjectStore.save(project_id, name, thread_id, workspace_path="")
+        WorkspaceStore.unbind_external_dir(thread_id)
+    # 挂载源变了：旧容器必须删除，下次执行时按新目录重建
+    docker_runtime.remove_container(thread_id)
+
+
+def _switch_to_workspace(path: Path) -> None:
+    """把工作目录作为项目入口：已绑定该目录则切过去，否则以目录名新建项目。"""
+    target = str(path)
+    for project in ProjectStore.list_all():
+        if (project.get("workspace_path") or "") == target:
+            st.session_state.project_id = project["id"]
+            st.session_state.thread_id = project["thread_id"]
+            st.session_state.project_name = project["name"]
+            st.session_state.watching_run = None
+            WorkspaceStore.bind_external_dir(project["thread_id"], path)
             return
-        # 容器名随目录名走：先清理容器，再删沙盒目录、对话历史与项目档案
-        docker_runtime.remove_container(thread_id)
-        WorkspaceStore.delete_workspace(thread_id)
-        delete_messages_by_workspace(thread_id)
-        ProjectStore.delete(st.session_state.project_id)
-        remaining = [
-            p for p in ProjectStore.list_all() if p["id"] != st.session_state.project_id
-        ]
-        # 删的是当前项目：切到最近更新的项目；一个不剩就补一个默认项目
-        nxt = remaining[0] if remaining else ProjectStore.create_new("Default Project")
-        st.session_state.project_id = nxt["id"]
-        st.session_state.thread_id = nxt["thread_id"]
-        st.session_state.project_name = nxt["name"]
-        st.session_state.watching_run = None
-        st.rerun(scope="app")
+    new_project = ProjectStore.create_new(path.name or "Local Project", workspace_path=target)
+    st.session_state.project_id = new_project["id"]
+    st.session_state.thread_id = new_project["thread_id"]
+    st.session_state.project_name = new_project["name"]
+    st.session_state.watching_run = None
+    WorkspaceStore.bind_external_dir(new_project["thread_id"], path)
+
+
+@st.fragment(run_every=1.0)
+def _render_tool_approvals() -> None:
+    """高危工具调用的审核面板：执行线程正阻塞等待这里的结论。"""
+    items = approval.list_pending()
+    if not items:
+        return
+    for item in items:
+        with st.container(border=True):
+            st.markdown(f"**🛡️ 需要你确认工具调用：`{item.tool_name}`**")
+            st.caption(item.impact)
+            st.code(item.arguments or "（无参数）", language="text")
+            remember = st.checkbox(
+                "本会话内不再询问该工具",
+                key=f"remember-{item.id}",
+                help="勾选后，本次运行期间该工具的所有调用都会直接放行；重启应用后恢复询问。",
+            )
+            col_allow, col_deny = st.columns(2)
+            if col_allow.button(
+                "允许执行", type="primary", key=f"approve-{item.id}", width="stretch"
+            ):
+                approval.resolve(item.id, True, remember=remember)
+                # 只刷新本 fragment：审核结论由后台线程消费，没必要全量重跑整页
+                #（全量 rerun 会销毁其它 run_every fragment，触发旧分片请求被丢弃）
+                st.rerun(scope="fragment")
+            if col_deny.button("拒绝", key=f"reject-{item.id}", width="stretch"):
+                approval.resolve(item.id, False)
+                st.rerun(scope="fragment")
 
 
 @st.fragment(run_every=2.0)
 def _render_vfs_panel() -> None:
-    """虚拟文件系统面板：每 2 秒自刷新一次，harness 执行中新写的文件即时出现。
+    """本地目录文件面板：每 2 秒直接扫描当前工作区目录，执行中新写的文件即时出现。
 
-    数据源合并两份索引——主图 state.files（流水线结束时才统一同步）与工作区
-    元数据表（write_file 工具落盘时实时登记）。执行期间后者始终领先，合并后
-    不必等执行结束才看到产出；空闲时两份一致，多一次轻量查询而已。
+    磁盘是唯一事实来源：不读 state 里的索引、也不查数据库。
     """
-    live_files = WorkspaceStore.manifest(workspace_id)
-    state_files = (get_main_agent().get_state(config).values or {}).get("files", {})
-    merged = {**state_files, **live_files}
+    merged = WorkspaceStore.scan_index(workspace_id)
     if not merged:
         st.caption("工作区中还没有文件。")
     else:
@@ -241,28 +329,13 @@ def _render_vfs_panel() -> None:
                     else:
                         file_viewer(path, content)
             with row[1]:
-                # 删除：同时清掉 sandbox 实体、state 索引与项目存档，
+                # 删除：同时清掉工作区实体与项目存档，
                 # 否则产出文件会在侧边栏里无限堆叠
                 if st.button("🗑️", key=f"del-vfs-{path}", help=f"删除 {path}", width="stretch"):
                     WorkspaceStore.delete(workspace_id, path)
-                    # 清掉主图 state 里的文件索引。空会话（尚无消息）必须跳过：
-                    # update_state 会从 as_node="agent" 继续路由，should_continue
-                    # 读取 messages[-1]，空消息列表直接 IndexError。而空会话时
-                    # state.files 本来就是空的，没有索引需要清。
-                    graph_values = get_main_agent().get_state(config).values or {}
-                    if graph_values.get("messages"):
-                        get_main_agent().update_state(
-                            config, {"files": {path: None}}, as_node="agent"
-                        )
-                    ProjectStore.save(
-                        st.session_state.project_id,
-                        st.session_state.project_name,
-                        st.session_state.thread_id,
-                        files={k: v for k, v in merged.items() if k != path},
-                    )
                     st.toast(f"已删除 `{path}`。", icon="🗑️")
 
-        # 一键导出：把虚拟文件系统中的全部文件导入本地（用户浏览确认后的受控通道）
+        # 一键导出：把当前工作目录中的全部文件复制到导出目录（用户浏览确认后的受控通道）
         if st.button("📥 导入到本地", width="stretch", key="export_vfs_to_local"):
             safe_name = "".join(
                 c for c in st.session_state.get("project_name", "") if c not in '\\/:*?"<>|'
@@ -291,45 +364,65 @@ def _render_vfs_panel() -> None:
 
 with st.sidebar:
     st.markdown("<div class='sidebar-section'>当前项目</div>", unsafe_allow_html=True)
-    name_col, del_col = st.columns([0.82, 0.18], vertical_alignment="center")
-    with name_col:
-        st.markdown(
-            f"<div style='font-size:17px;font-weight:600;margin-bottom:14px;'>{st.session_state.project_name}</div>",
-            unsafe_allow_html=True,
-        )
-    with del_col:
-        if st.button("🗑️", key="del-project", help="删除当前项目", width="stretch"):
-            _confirm_delete_project()
-
-    # 项目选择器：列出数据库中的全部项目，选中即切换到对应项目
-    all_projects = ProjectStore.list_all()
-    project_ids = [p["id"] for p in all_projects]
-
-    def _switch_project() -> None:
-        selected = next(
-            (p for p in all_projects if p["id"] == st.session_state["project_selector"]),
-            None,
-        )
-        if not selected:
-            return
-        st.session_state.project_id = selected["id"]
-        st.session_state.thread_id = selected["thread_id"]
-        st.session_state.project_name = selected["name"]
-        # 切换后要盯的是新项目自己的运行（若它在后台还有任务，会自动接上）
-        st.session_state.watching_run = None
-
-    st.selectbox(
-        "切换项目",
-        project_ids,
-        index=next(
-            (i for i, p in enumerate(all_projects) if p["id"] == st.session_state.project_id),
-            0,
-        ),
-        format_func=lambda pid: next((p["name"] for p in all_projects if p["id"] == pid), pid),
-        key="project_selector",
-        on_change=_switch_project,
-        disabled=not all_projects,
+    st.markdown(
+        f"<div style='font-size:17px;font-weight:600;margin-bottom:14px;'>{st.session_state.project_name}</div>",
+        unsafe_allow_html=True,
     )
+
+    # 工作目录：切换目录即切换项目；目录未关联过项目时以目录名新建
+    with st.expander("工作目录", icon=":material/folder_open:", expanded=True):
+        external = WorkspaceStore.external_dir_of(workspace_id)
+        if external is not None:
+            st.caption(f"当前：`{external}`")
+        else:
+            st.caption(
+                f"当前：默认沙盒目录 `sandbox/{WorkspaceStore.dir_name_of(workspace_id)}`"
+            )
+
+        ws_key = f"workspace-path-{st.session_state.project_id}"
+        # 浏览/重置按钮产生的值先寄存，等下一次运行、输入框尚未实例化时再写入
+        pending = st.session_state.pop("_pending_ws_path", None)
+        if pending is not None:
+            st.session_state[ws_key] = pending
+        if ws_key not in st.session_state:
+            st.session_state[ws_key] = str(external) if external else ""
+
+        path_input = st.text_input(
+            "本地项目目录（绝对路径）", key=ws_key, placeholder=r"D:\projects\my-app"
+        )
+        busy = (
+            active_run(workspace_id, channel="main")
+            or active_run(workspace_id, channel="harness")
+        )
+        col_pick, col_apply = st.columns(2)
+        if col_pick.button("浏览…", width="stretch", key="pick-workspace-dir"):
+            picked = _pick_local_directory()
+            if picked:
+                st.session_state["_pending_ws_path"] = picked
+                st.rerun()
+        if col_apply.button("打开", type="primary", width="stretch", key="open-workspace-dir"):
+            if busy:
+                st.error("当前项目仍有任务在运行，请先停止执行再切换目录。")
+            else:
+                resolved, error = WorkspaceStore.validate_external_dir(path_input)
+                if error:
+                    st.error(error)
+                else:
+                    _switch_to_workspace(resolved)
+                    st.session_state["_pending_ws_path"] = str(resolved)
+                    st.toast(f"已打开工作目录：{resolved}", icon="📂")
+                    st.rerun()
+        if external is not None and st.button(
+            "使用默认沙盒目录", width="stretch", key="reset-workspace-dir"
+        ):
+            if busy:
+                st.error("当前项目仍有任务在运行，请先停止执行再切换目录。")
+            else:
+                _bind_workspace_dir("")
+                st.session_state["_pending_ws_path"] = ""
+                st.toast("已切回默认沙盒目录", icon="↩️")
+                st.rerun()
+        st.caption("打开目录即切换到对应项目；新目录会自动创建一个同名项目。")
 
     # 项目重命名折叠面板
     with st.expander("重命名项目", icon=":material/edit:"):
@@ -337,15 +430,15 @@ with st.sidebar:
         if st.button("保存名称"):
             # 容器名随目录名走：先按旧名清理容器，再重命名 sandbox 目录
             docker_runtime.remove_container(st.session_state.thread_id)
-            ProjectStore.save(st.session_state.project_id, new_name, st.session_state.thread_id, files=files)
+            ProjectStore.save(st.session_state.project_id, new_name, st.session_state.thread_id)
             WorkspaceStore.rename_workspace(st.session_state.thread_id, new_name)
             st.session_state.project_name = new_name
             st.rerun()
 
     st.divider()
 
-    # 虚拟文件系统：fragment 内部每 2 秒刷新，执行中的新文件即时可见
-    st.markdown("<div class='sidebar-section'>虚拟文件系统</div>", unsafe_allow_html=True)
+    # 本地目录文件：fragment 内部每 2 秒刷新，执行中新写的文件即时可见
+    st.markdown("<div class='sidebar-section'>本地目录文件</div>", unsafe_allow_html=True)
     _render_vfs_panel()
 
     # Docker 容器沙盒状态（每个项目一个常驻容器：1 CPU / 1GB 内存）
@@ -353,7 +446,8 @@ with st.sidebar:
         if docker_runtime.is_docker_available():
             st.caption(
                 f"镜像：`{DOCKER_IMAGE}` · 限制：`{DOCKER_CPUS} CPU / {DOCKER_MEMORY}`\n\n"
-                "代码执行在该项目的容器内进行，工作区挂载为 `/app/workspace`。"
+                "代码执行在该项目的容器内进行：**强制断网**、根文件系统**只读**，"
+                "仅挂载进来的工作区（`/app/workspace`）可写。"
             )
             st.code(
                 f"docker stats {docker_runtime.container_name(workspace_id)}",
@@ -796,17 +890,6 @@ with st.sidebar:
                 st.toast(f"已删除 harness `{h['name']}`。", icon="🗑️")
                 st.rerun()
 
-    # 会话操作
-    if st.button("🔄 Clear State / Restart", width="stretch"):
-        # 可以通过写入空状态或新建一个线程来清空状态
-        new_proj = ProjectStore.create_new(f"Project - {str(uuid.uuid4())[:8]}")
-        st.session_state.project_id = new_proj["id"]
-        st.session_state.thread_id = new_proj["thread_id"]
-        st.session_state.project_name = new_proj["name"]
-        # 新项目对应新的工作区，上一次执行的实时过程不再展示
-        st.session_state.watching_run = None
-        st.rerun()
-
 # ── 运行时辅助函数 ────────────────────────────────────────────────────
 
 # 思考块里分隔「不同模型调用」的推理片段
@@ -922,10 +1005,9 @@ def apply_harness_event(progress: dict, event: dict) -> None:
 
 
 def _base_sandbox_state() -> dict:
-    """取当前项目线程里的沙箱状态，作为直达执行的输入。"""
+    """取当前项目工作区的状态，作为直达执行的输入（文件直接读目录）。"""
     values = get_main_agent().get_state(config).values or {}
     return {
-        "files": values.get("files", {}),
         # 子智能体靠这个标识定位到本项目自己的工作区
         "workspace_id": workspace_id,
         "todos": values.get("todos", []),
@@ -1002,7 +1084,6 @@ def _persist_direct_result(replies: list, final_state: dict,
     get_main_agent().update_state(
         thread_config,
         {
-            "files": final_state.get("files", base.get("files", {})),
             "todos": final_state.get("todos", base.get("todos", [])),
             "execution_log": final_state.get("execution_log", base.get("execution_log", [])),
         },
@@ -1012,13 +1093,6 @@ def _persist_direct_result(replies: list, final_state: dict,
     # 只归档本轮写回的结论：用户输入已由 _persist_user_input 落盘，
     # harness 子图里的中间稿也不再入库，否则历史里会出现重复的用户消息与阶段稿
     archive_messages(ws_id, messages, channel=channel)
-
-
-def _persist_project_files(thread_config: dict, ws_id: str,
-                           project_id: str, project_name: str) -> None:
-    """执行结束后把检查点里的文件索引同步进项目记录（两种模式共用）。"""
-    values = get_main_agent().get_state(thread_config).values or {}
-    ProjectStore.save(project_id, project_name, ws_id, files=values.get("files", {}))
 
 
 # 主智能体思考过程在注册表里最多保留这么多字符：模型可能连续推理很久，
@@ -1068,7 +1142,6 @@ def _harness_worker(run_id: str, harness_config: dict, init_state: dict,
         finish_run(run_id, "cancelled")
         _persist_cancelled_notice(
             harness_name, thread_config, ws_id, channel="harness")
-        _persist_project_files(thread_config, ws_id, project_id, project_name)
         flush_archive()
         return
     except Exception as e:
@@ -1093,7 +1166,6 @@ def _harness_worker(run_id: str, harness_config: dict, init_state: dict,
     _persist_direct_result(
         stage_replies[-1:], final_state, thread_config=thread_config, ws_id=ws_id,
         channel="harness")
-    _persist_project_files(thread_config, ws_id, project_id, project_name)
     # 等归档写完再让界面重绘，否则新页面从数据库读不到本次产出
     flush_archive()
 
@@ -1182,12 +1254,10 @@ def _fill_cancelled_tool_calls(thread_config: dict, ws_id: str) -> None:
     archive_messages(ws_id, filled, channel="main")
 
 
-def _persist_main_result(thread_config: dict, ws_id: str,
-                         project_id: str, project_name: str) -> None:
-    """主智能体跑完后把检查点里的消息与文件落盘到主智能体这份历史。"""
+def _persist_main_result(thread_config: dict, ws_id: str) -> None:
+    """主智能体跑完后把检查点里的消息归档到主智能体这份历史。"""
     values = get_main_agent().get_state(thread_config).values or {}
     archive_messages(ws_id, values.get("messages") or [], channel="main")
-    ProjectStore.save(project_id, project_name, ws_id, files=values.get("files", {}))
     flush_archive()
 
 
@@ -1248,7 +1318,7 @@ def _main_agent_worker(run_id: str, payload, thread_config: dict, ws_id: str,
         # 否则历史里只剩一条没有回复的用户消息，用户看不出是被自己停掉的
         _fill_cancelled_tool_calls(thread_config, ws_id)
         _persist_cancelled_notice("", thread_config, ws_id, channel="main")
-        _persist_main_result(thread_config, ws_id, project_id, project_name)
+        _persist_main_result(thread_config, ws_id)
         return
     except Exception as e:
         debug_log(f"[main_orchestrator] FAILED {type(e).__name__}: {e}\n{traceback.format_exc()}")
@@ -1260,7 +1330,7 @@ def _main_agent_worker(run_id: str, payload, thread_config: dict, ws_id: str,
         return
 
     finish_run(run_id, "done")
-    _persist_main_result(thread_config, ws_id, project_id, project_name)
+    _persist_main_result(thread_config, ws_id)
 
 
 def start_main_run(turn_input: str | Command) -> None:
@@ -1447,7 +1517,7 @@ _flush_round()
 with col3:
     # 条数 = 用户消息数 + 正式答复数，与下方对话界面的渲染口径一致
     render_stat_chips(
-        len(files),
+        len(WorkspaceStore.scan_dir(workspace_id)),
         sum(isinstance(m, HumanMessage) for m in messages) + len(final_reply_ids),
     )
 
@@ -1532,7 +1602,9 @@ def _stop_button(run_id: str, cancelling: bool = False) -> None:
             disabled=cancelling,
         ):
             cancel_run(run_id)
-            st.rerun(scope="app")
+            # 终止标记已写进注册表，本 fragment 重跑即可显示「正在终止…」；
+            # 不做全量 rerun，避免与其它每秒钟刷新一次的分片抢跑
+            st.rerun(scope="fragment")
 
 
 def _render_harness_run(snap: dict) -> None:
@@ -1633,6 +1705,9 @@ def render_active_run() -> None:
 
 render_active_run()
 
+# ── 高危工具审核：工具线程阻塞等待这里给出的允许 / 拒绝结论 ───────────
+_render_tool_approvals()
+
 # ── 追问面板：主智能体停在 ask_user 处时，在这里回答问题 ──────────────
 # 任务此时是暂停态：用户只能在面板作答，作答后用 Command(resume=...) 回到
 # 被暂停的位置继续本轮任务，答案作为工具结果回传模型，不会多出一条用户消息。
@@ -1680,20 +1755,19 @@ if resume_value is not None:
     st.rerun()
 
 if user_input:
-    # 1. 渲染用户提示词
-    with st.chat_message("user"):
-        st.markdown(user_input)
-
     if active_run(workspace_id, channel=current_channel):
+        # 被拒绝的提交不会进入历史，这里仍回显一次，避免用户以为消息丢了
+        with st.chat_message("user"):
+            st.markdown(user_input)
         # 两种执行方式各自独立：只有当前渠道在跑时才拒绝新输入
         st.warning("当前模式已有一条任务在运行，请等它结束或点击停止后再提交。")
     else:
-        # 2. 若上一轮运行被中断，先补齐缺失的工具结果，避免会话状态卡死
+        # 1. 若上一轮运行被中断，先补齐缺失的工具结果，避免会话状态卡死
         repaired_tools = repair_interrupted_tool_calls()
         if repaired_tools:
             st.warning(f"⚠️ 上一轮运行被中断，已补齐工具调用记录：{', '.join(repaired_tools)}")
 
-        # 3. 按执行模式分发（两者都在后台线程里跑，误点选择器不会打断执行）：
+        # 2. 按执行模式分发（两者都在后台线程里跑，误点选择器不会打断执行）：
         #    Harness  → 直接编译执行流水线，渲染每个节点的执行过程
         #    Main     → 由主智能体编排（拆解 / 分发子智能体 / 整合结果）
         if st.session_state.exec_mode == MODE_HARNESS:
@@ -1701,6 +1775,10 @@ if user_input:
         else:
             start_main_run(user_input)
 
+        # 3. 先把这条用户消息真正写进归档表再 rerun：归档是异步队列，
+        #    不等它落库，新页面读不到这条消息，只能靠本次运行的即时渲染，
+        #    两次渲染叠加就会短暂出现两条相同的用户气泡
+        flush_archive()
         # 4. rerun 进入干净的回放形态，执行过程由进度区从注册表接上
         st.rerun()
 

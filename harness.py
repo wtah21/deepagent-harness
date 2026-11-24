@@ -9,13 +9,11 @@ import datetime
 import json
 import os
 import re
-import shutil
-import sys
-import tempfile
 import threading
 import time
 import uuid
-from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from typing import Annotated, Any, Callable, Dict, Literal, Optional
 from langgraph.graph import StateGraph, START, END
 from langgraph.config import get_stream_writer
@@ -34,7 +32,8 @@ except ImportError:  # pragma: no cover
 from config import (
     DEFAULT_RECURSION_LIMIT, SUBAGENT_RECURSION_LIMIT,
     DEFAULT_MODEL, DEFAULT_MAX_TOKENS, DEFAULT_TEMPERATURE,
-    PROJECT_ROOT, debug_log,
+    PARALLEL_STAGE_TIMEOUT, PARALLEL_TOTAL_TIMEOUT,
+    debug_log,
 )
 from state import DeepAgentState, workspace_of
 from subagents import AgentFactory
@@ -104,6 +103,8 @@ def create_run(workspace_id: str, harness_name: str, strategy: str, progress: di
         "started_at": time.time(),
         "error": "",
         "cancel_requested": False,
+        # 并行策略里某个分支超时后单独置位，不影响其它分支
+        "cancelled_stages": set(),
         "progress": progress,
     }
     with _runs_lock:
@@ -137,6 +138,25 @@ def cancel_run(run_id: str) -> None:
             run["cancel_requested"] = True
 
 
+def cancel_stage(run_id: Optional[str], stage: str) -> None:
+    """终止单个并行分支（超时兜底）：不影响同一运行里的其它分支。"""
+    if not run_id or not stage:
+        return
+    with _runs_lock:
+        run = _runs.get(run_id)
+        if run is not None:
+            run.setdefault("cancelled_stages", set()).add(stage)
+
+
+def is_stage_cancelled(run_id: Optional[str], stage: Optional[str]) -> bool:
+    """该分支是否已被单独终止（例如等待超时）。"""
+    if not run_id or not stage:
+        return False
+    with _runs_lock:
+        run = _runs.get(run_id)
+        return bool(run and stage in (run.get("cancelled_stages") or ()))
+
+
 def is_cancelled(run_id: Optional[str]) -> bool:
     """该运行是否已被请求终止。"""
     if not run_id:
@@ -149,19 +169,32 @@ def is_cancelled(run_id: Optional[str]) -> bool:
 _run_local = threading.local()
 
 
-def bind_run(run_id: str) -> None:
-    """把当前线程与一次运行绑定：工具内部（如 run_harness）据此检查取消标记。"""
+def bind_run(run_id: Optional[str], stage: Optional[str] = None) -> None:
+    """把当前线程与一次运行（及其分支）绑定：工具内部据此检查取消标记。
+
+    并行分支跑在线程池里，线程本地变量不会自动继承，
+    因此工作线程启动时需要用同一个 run_id 重新绑定一次。
+    """
     _run_local.run_id = run_id
+    _run_local.stage = stage
 
 
 def current_run_id() -> Optional[str]:
     return getattr(_run_local, "run_id", None)
 
 
+def current_stage() -> Optional[str]:
+    return getattr(_run_local, "stage", None)
+
+
 def check_cancelled() -> None:
     """在事件边界检查一次取消标记，被终止时抛出 RunCancelled 交由执行线程收尾。"""
-    if is_cancelled(current_run_id()):
+    run_id = current_run_id()
+    if is_cancelled(run_id):
         raise RunCancelled("用户终止了执行")
+    stage = current_stage()
+    if is_stage_cancelled(run_id, stage):
+        raise RunCancelled(f"分支 {stage} 已超时终止")
 
 
 def snapshot_run(run_id: str) -> Optional[dict]:
@@ -409,6 +442,14 @@ async def _astream_graph(compiled_graph: Any, init_state: dict, sink: Callable[[
 
 # ── parallel 策略：分发器 / 子任务沙盒 / 汇总器 ──────────────────────
 
+# 每轮并行 run 的专用线程池：子智能体链路是同步阻塞调用，只能丢进线程。
+# 不用 asyncio.to_thread（事件循环默认 executor）的原因：asyncio.run 收尾时
+# 会等待默认 executor 的所有线程结束，而分支线程无法强杀，一旦某个分支超时，
+# 整条流水线会卡在退出阶段。用显式池 + shutdown(wait=False) 才能真正收尾。
+_parallel_pool: ContextVar[Optional[ThreadPoolExecutor]] = ContextVar(
+    "harness_parallel_pool", default=None)
+
+
 class DispatchTaskDraft(BaseModel):
     """分发器输出的单个子任务。"""
     agent_name: str = Field(description="执行该子任务的智能体名，必须来自给定的可分发智能体清单")
@@ -458,11 +499,6 @@ def _llm_client() -> ChatOpenAI:
             base_url=os.getenv("BASE_URL", ""),
         )
     return _harness_llm
-
-
-def _safe_name(name: str) -> str:
-    """把智能体名清洗成可用于目录名/文件名的片段。"""
-    return re.sub(r"[^A-Za-z0-9_.-]+", "-", str(name or "agent"))[:32] or "agent"
 
 
 def _agent_role(agent_name: str) -> str:
@@ -530,181 +566,120 @@ def _dispatch_tasks(stages: list[dict], task: str) -> list[dict]:
     return tasks
 
 
-def _seed_sandbox(workspace_id: str, sandbox_dir: Path, files: dict) -> None:
-    """把主工作区中该阶段可见的文件复制进子任务沙盒，实现写时隔离。"""
-    if not files:
-        return
-    source_root = WorkspaceStore.workspace_dir(workspace_id)
-    for rel in files:
-        source = source_root / rel
-        if not source.is_file():
-            continue
-        dest = sandbox_dir / rel
-        dest.parent.mkdir(parents=True, exist_ok=True)
+def _capture_stream_writer() -> Callable[[dict], None]:
+    """在当前节点上下文里捕获流写入器，供线程池中的并行分支透传事件。
+
+    get_stream_writer 依赖 contextvar，线程池里的工作线程拿不到父节点的执行
+    上下文；因此在节点（事件循环线程）里先取好，把闭包交给工作线程使用。
+    """
+    try:
+        writer = get_stream_writer()
+    except Exception:
+        writer = None
+    if writer is None:
+        return lambda event: None
+
+    def emit(event: dict) -> None:
         try:
-            shutil.copy2(source, dest)
-        except OSError:
-            continue
+            writer(event)
+        except Exception:
+            pass
+
+    return emit
+
+
+def _run_parallel_branch(
+        agent_name: str,
+        instructions: str,
+        workspace_id: str,
+        run_id: Optional[str],
+        sink: Callable[[dict], None],
+    ) -> dict:
+    """线程池中执行一个并行分支：同步跑子智能体，事件经捕获的流写入器透传。"""
+    # 线程本地变量不会跨线程继承：重新绑定后分支内才能检查取消标记
+    bind_run(run_id, agent_name)
+    agent = AgentFactory.get_agent(agent_name)
+    return stream_subagent(
+        agent,
+        {
+            "messages": [HumanMessage(content=instructions)],
+            "workspace_id": workspace_id,
+        },
+        agent_name,
+        1,
+        sink,
+    )
 
 
 async def _run_parallel_subagent(stage: dict, task: dict, state: DeepAgentState) -> dict:
-    """在独立进程 + 独立沙盒目录中执行一个子智能体，返回它的文件提案。
+    """在线程池里执行一个并行分支，返回该分支的结论。
 
-    子进程内部读写自己那份文件树，主进程只在结束时接收「变更文件内容」，
-    因此多个子智能体并行修改同一文件不会互相覆盖。
+    所有分支共享同一个工作区目录：文件直接落盘、不复制沙盒，也不回收
+    「文件提案」。多条分支同时写同一路径时，由 WorkspaceStore 的文件锁
+    串行化（见 write_lock），因此仍能保证写入不被静默覆盖。
     """
     agent_name = stage["agent_name"]
     workspace_id = workspace_of(state)
-    sandbox_dir = Path(tempfile.mkdtemp(prefix=f"harness_{_safe_name(agent_name)}_"))
-    request_path = sandbox_dir.parent / f"{sandbox_dir.name}.json"
-
-    passed_files = dict(state.get("files") or {}) if stage.get("pass_files", True) else {}
-    _seed_sandbox(workspace_id, sandbox_dir, passed_files)
-    request_path.write_text(
-        json.dumps({
-            "agent_name": agent_name,
-            "instructions": task["instructions"],
-            "workspace_id": workspace_id,
-            "sandbox_dir": str(sandbox_dir),
-            "files": passed_files,
-            "recursion_limit": DEFAULT_RECURSION_LIMIT,
-        }, ensure_ascii=False),
-        encoding="utf-8",
-    )
-
-    final_payload: Optional[dict] = None
-    stderr_chunks: list[bytes] = []
-    proc: Optional[asyncio.subprocess.Process] = None
-
-    async def _drain_stderr() -> None:
-        while True:
-            chunk = await proc.stderr.read(8192)
-            if not chunk:
-                return
-            stderr_chunks.append(chunk)
+    run_id = current_run_id()
+    timeout = float(stage.get("timeout") or PARALLEL_STAGE_TIMEOUT)
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable, "-m", "parallel_worker", str(request_path),
-            cwd=str(PROJECT_ROOT),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            limit=4 * 1024 * 1024,
+        args = (
+            agent_name,
+            task["instructions"],
+            workspace_id,
+            run_id,
+            _capture_stream_writer(),
         )
-        drain = asyncio.create_task(_drain_stderr())
-
-        async for raw in proc.stdout:
-            # 每个子进程事件都是一次边界：用户终止时立刻停，由 finally 收掉子进程
-            check_cancelled()
-            line = raw.decode("utf-8", "replace").strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue  # 忽略非协议输出
-            if event.get("type") == "final":
-                final_payload = event
-            elif isinstance(event, dict):
-                _emit_stream_event(event)
-
-        returncode = await proc.wait()
-        await drain
-        stderr_text = b"".join(stderr_chunks).decode("utf-8", "replace").strip()
-
-        if final_payload is None:
-            return {
-                "status": "error",
-                "summary": (
-                    f"⚠️ 子进程异常退出（exit={returncode}），没有产出任何文件。"
-                    + (f"\n{stderr_text[-800:]}" if stderr_text else "")
-                ),
-                "files": {},
-            }
-        return final_payload
-    finally:
-        # 被终止时子进程还在跑，必须先杀掉再清理沙盒，否则进程会留在后台继续写临时目录
-        if proc is not None and proc.returncode is None:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            try:
-                await proc.wait()
-            except Exception:
-                pass
-        shutil.rmtree(sandbox_dir, ignore_errors=True)
-        try:
-            request_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-
-
-def _conflict_alias(path: str, agent_name: str) -> str:
-    """为冲突文件生成带智能体后缀的别名路径，便于用户人工比对。"""
-    target = Path(path)
-    name = f"{target.stem}.conflict-{_safe_name(agent_name)}{target.suffix}"
-    return str(target.with_name(name)).replace("\\", "/")
-
-
-def _merge_conflict(path: str, versions: dict[str, str]) -> tuple[Optional[str], str]:
-    """让模型合并多个智能体对同一文件的不同版本。
-
-    返回 (合并后的内容, 无法合并的原因)；成功时原因为空串。
-    """
-    blocks = "\n\n".join(
-        f"## 版本 {agent_name}\n```\n{content}\n```"
-        for agent_name, content in versions.items()
-    )
-    prompt = f"""你是并行子任务的「冲突裁决器」。多个子智能体并行修改了同一个文件，需要合并成一个最终版本。
-
-    文件：{path}
-
-    {blocks}
-
-    要求：
-    - 保留各版本中互不冲突的改动；语义冲突处按「更完整、更正确」的原则裁决；
-    - 只输出合并后的完整文件内容，不要解释、不要 Markdown 代码围栏；
-    - 如果确实无法合并（两版实现互斥且无法取舍），只输出一行：UNMERGEABLE:<一句话原因>"""
-
-    try:
-        reply = _llm_client().invoke(prompt)
-        text = str(reply.content).strip()
+        pool = _parallel_pool.get()
+        if pool is not None:
+            branch = asyncio.get_running_loop().run_in_executor(
+                pool, _run_parallel_branch, *args)
+        else:  # 兜底：没有注入专用池时（例如被单独调用）仍走默认线程池
+            branch = asyncio.to_thread(_run_parallel_branch, *args)
+        final_state = await asyncio.wait_for(branch, timeout=timeout)
+    except asyncio.TimeoutError:
+        # 线程无法强杀：置位该分支的取消标记，让它在下一个事件边界自行退出
+        cancel_stage(run_id, agent_name)
+        return {
+            "status": "error",
+            "summary": f"⏱ 子任务超过 {timeout:.0f}s 未完成，已请求终止该分支。",
+        }
+    except RunCancelled:
+        if is_cancelled(run_id):
+            raise  # 整条运行被用户终止，交给外层统一收尾
+        return {"status": "error", "summary": "子任务已被终止（超时）。"}
+    except HarnessStepExhausted as e:
+        return {"status": "error", "summary": f"⚠️ {e}"}
     except Exception as e:
-        return None, f"合并模型调用失败：{type(e).__name__}: {e}"
+        debug_log(f"[harness.parallel] {agent_name} 执行失败：{type(e).__name__}: {e}")
+        return {"status": "error", "summary": f"⚠️ 子任务执行失败：{type(e).__name__}: {e}"}
 
-    if not text:
-        return None, "合并模型返回了空内容"
-    stripped = text.strip()
-    if stripped.startswith("```"):
-        # 模型偶尔无视要求，仍用代码围栏包裹
-        stripped = re.sub(r"^```[^\n]*\n", "", stripped)
-        stripped = re.sub(r"\n```\s*$", "", stripped).strip()
-    if stripped.upper().startswith("UNMERGEABLE"):
-        reason = stripped.split(":", 1)[1].strip() if ":" in stripped else stripped
-        return None, reason or "无法合并"
-    return stripped, ""
+    messages = final_state.get("messages") or []
+    summary = str(messages[-1].content) if messages else ""
+    if summary.strip() == _STEPS_EXHAUSTED_TEXT:
+        return {"status": "error", "summary": "⚠️ 子任务在步数预算内仍未完成。"}
+    return {"status": "success", "summary": summary}
 
 
 def _final_summary(
             state: DeepAgentState,
             proposals: dict,
-            final_files: dict[str, str],
-            unresolved: dict[str, str],
+            written_paths: list[str],
     ) -> str:
-    """根据各子任务结论与最终文件产出生成汇总回复（模型失败时用规则拼接兜底）。"""
+    """根据各分支结论与本次真正改动过的文件生成汇总回复（模型失败时用规则拼接兜底）。"""
     task = _initial_task(state)
     blocks = []
+    failed = []
     for name, proposal in proposals.items():
         # 只把各分支的结论交给汇总模型：分发器下发的子任务指令不进入最终答复
         blocks.append(f"### {name}\n{_truncate(proposal.get('summary', ''), 1200)}")
-    written = "\n".join(f"- {path}" for path in sorted(final_files)) or "（无）"
-    conflict_note = ""
-    if unresolved:
-        conflict_note = "\n\n无法自动合并的文件：\n" + "\n".join(
-            f"- {path}：{reason}（各版本已按 .conflict-<智能体> 后缀另存）"
-            for path, reason in unresolved.items()
-        )
+        if proposal.get("status") != "success":
+            failed.append(name)
+    written = "\n".join(f"- {path}" for path in written_paths) or "（无）"
+    failure_note = ""
+    if failed:
+        failure_note = "\n\n执行失败或超时的分支：" + "、".join(failed)
 
     prompt = f"""你是多智能体并行流水线的「汇总器」。请根据下面的执行结果，给用户一份连贯的最终答复。
 
@@ -714,13 +689,13 @@ def _final_summary(
     ## 各子智能体的执行结果
     {chr(10).join(blocks) if blocks else '（没有子智能体产出）'}
 
-    ## 最终写入工作区的文件
+    ## 本次运行新增或修改的文件
     {written}
-    {conflict_note}
+    {failure_note}
 
     要求：
     - 说明整体完成了什么、关键产出在哪些文件、分别由哪个智能体完成；
-    - 如有冲突或失败，如实说明影响与遗留问题；
+    - 如有失败或超时的分支，如实说明影响与遗留问题；
     - 不要复述工具调用过程，不要输出完整代码；
     - 使用简体中文，控制在 400 字以内。"""
 
@@ -733,70 +708,42 @@ def _final_summary(
         debug_log(f"[harness.aggregator] 汇总回复失败，使用规则拼接：{type(e).__name__}: {e}")
 
     parts = ["并行流水线已完成。"]
-    if final_files:
-        parts.append("产出文件：" + "、".join(sorted(final_files)) + "。")
+    if written_paths:
+        parts.append("产出文件：" + "、".join(written_paths) + "。")
     for name, proposal in proposals.items():
         parts.append(f"- {name}：{_clip(proposal.get('summary', ''), 200)}")
-    if unresolved:
-        parts.append("以下文件存在无法自动合并的冲突，已另存为 .conflict-<智能体> 文件："
-                     + "、".join(unresolved) + "。")
+    if failed:
+        parts.append("以下分支执行失败或超时：" + "、".join(failed) + "。")
     return "\n".join(parts)
 
 
 def _aggregator_node(state: DeepAgentState) -> dict:
-    """汇总节点：冲突检测 → 合并 → 写回 files → 生成最终回复。"""
+    """汇总节点：识别本次运行改动的文件 → 生成最终回复。
+
+    并行分支直接写共享工作区，不再有「文件提案」需要合并；
+    同一路径的并发写由文件锁串行化，因此这里只做统计与总结。
+    """
     _emit_stream_event({"type": "node", "node": "aggregator", "round": 1, "phase": "start"})
     proposals = state.get("proposals") or {}
     workspace_id = workspace_of(state)
+    baseline = state.get("parallel_baseline") or {}
 
-    # path -> {agent_name: content}
-    versions: dict[str, dict[str, str]] = {}
-    for key, proposal in proposals.items():
-        name = proposal.get("agent_name") or key
-        for path, content in (proposal.get("files") or {}).items():
-            versions.setdefault(path, {})[name] = content
-
-    entries: dict[str, dict] = {}
-    final_files: dict[str, str] = {}
-    unresolved: dict[str, str] = {}
-
-    for path, candidates in versions.items():
-        if len(set(candidates.values())) == 1:
-            # 只有一个版本，或多个智能体写出了完全相同的内容：直接采用
-            final_files[path] = next(iter(candidates.values()))
-            continue
-
-        merged, reason = _merge_conflict(path, candidates)
-        if merged is not None:
-            final_files[path] = merged
-            continue
-
-        # 无法合并：各版本改名落盘供人工比对，原路径保持运行前的内容不被覆盖
-        unresolved[path] = reason
-        for agent_name, content in candidates.items():
-            final_files[_conflict_alias(path, agent_name)] = content
-
-    for path, content in final_files.items():
-        try:
-            # 索引键也归一化：子智能体可能用容器内绝对路径，避免侧边栏出现 /app/workspace 前缀
-            entries[WorkspaceStore.normalize_path(path) or path] = WorkspaceStore.write(
-                workspace_id, path, content
-            )
-        except (OSError, ValueError) as e:
-            unresolved.setdefault(path, f"写入失败：{type(e).__name__}: {e}")
-
-    summary = _final_summary(state, proposals, final_files, unresolved)
+    changed = sorted(
+        rel for rel, signature in WorkspaceStore.scan_dir(workspace_id).items()
+        if baseline.get(rel) != list(signature)
+    )
+    summary = _final_summary(state, proposals, changed)
+    failed = [name for name, p in proposals.items() if p.get("status") != "success"]
     log_entry = {
         "timestamp": datetime.datetime.now().isoformat(),
         "agent_name": "harness_engine",
         "action": "parallel_aggregate",
-        "summary": f"汇总 {len(proposals)} 个子智能体的提案，写入 {len(entries)} 个文件"
-                   + (f"，{len(unresolved)} 个文件存在冲突" if unresolved else "。"),
-        "status": "error" if unresolved else "success",
+        "summary": f"汇总 {len(proposals)} 个分支的结论，本次改动 {len(changed)} 个文件"
+                   + (f"，{len(failed)} 个分支失败" if failed else "。"),
+        "status": "error" if failed else "success",
     }
     _emit_stream_event({"type": "node", "node": "aggregator", "round": 1, "phase": "done"})
     return {
-        "files": entries,
         "messages": [AIMessage(content=summary)],
         "execution_log": list(state.get("execution_log") or []) + [log_entry],
     }
@@ -1053,7 +1000,7 @@ def _speaker_prompt(
 - 若你认为现有方案有问题，必须指出具体缺陷，并给出可执行的替代方案或改进措施；
 - 禁止无原则附和、禁止只做礼貌性肯定；你的职责本就与其他参会者冲突，请为你的立场辩护，\
 用事实与权衡（成本、质量、风险、工期）说服对方；
-- 需要产出代码或文档时，直接写入虚拟文件系统；
+- 需要产出代码或文档时，直接写入当前工作区；
 - 结尾用 2-3 句话给出你本轮的核心主张，便于主持人提炼。"""
 
 
@@ -1095,16 +1042,16 @@ BUILTIN_HARNESSES = [
         ),
         "strategy": "review_loop",
         "stages": [
-            {"agent_name": "coder", "instructions": "针对用户的需求编写一份完整的 Python 实现。", "pass_files": True,
+            {"agent_name": "coder", "instructions": "针对用户的需求编写一份完整的 Python 实现。",
              "description": "按需求写出完整实现；评审未通过时接收评审意见并迭代修复。"},
             {"agent_name": "tester", "instructions": (
-                "为虚拟文件系统中的实现编写并运行完整测试：覆盖正常路径、边界条件与错误处理。"
+                "为工作区中的实现编写并运行完整测试：覆盖正常路径、边界条件与错误处理。"
                 "发现失败时先修好测试本身（只有当实现确实有缺陷时才算实现的问题）。"
                 "输出要求：先列出测试结果与失败原因（每条标明文件、位置与建议），"
                 "然后**单独一行**给出结论——只要还存在失败的用例或缺失的关键覆盖，就输出 "
                 "'## 结论：NEEDS_FIX'；只有当全部用例通过且关键路径都已覆盖时才输出 "
                 "'## 结论：APPROVED'。"
-            ), "pass_files": True,
+            ),
              "description": "编写并运行测试，输出失败清单与 APPROVED / NEEDS_FIX 结论，决定是否回到编码阶段。"}
         ],
         "max_review_rounds": 3,
@@ -1120,32 +1067,14 @@ BUILTIN_HARNESSES = [
         ),
         "strategy": "sequential",
         "stages": [
-            {"agent_name": "architect", "instructions": "设计系统的架构与核心接口，并把设计写入 design.py", "pass_files": True,
+            {"agent_name": "architect", "instructions": "设计系统的架构与核心接口，并把设计写入 design.py",
              "description": "产出架构设计、模块划分与核心接口（design.py），为后续实现定边界。"},
-            {"agent_name": "coder", "instructions": "阅读 design.py，并按照设计实现完整方案。", "pass_files": True,
+            {"agent_name": "coder", "instructions": "阅读 design.py，并按照设计实现完整方案。",
              "description": "依据 design.py 实现完整方案，把架构设计落成可运行代码。"}
         ],
         "max_review_rounds": 1,
         "icon": "🏗️",
         "color": "#8b5cf6"
-    },
-    {
-        "name": "Research & Write",
-        "description": "由 Researcher 收集技术文档资料，Coder 依据研究结果实现代码。",
-        "purpose": (
-            "适合需要先查资料再动手的场景：技术选型调研、接入陌生的第三方库或 API、"
-            "需要带出处依据的实现与文档撰写。"
-        ),
-        "strategy": "sequential",
-        "stages": [
-            {"agent_name": "researcher", "instructions": "搜索网络，为该任务收集技术参考资料，并写入 research_notes.md。", "pass_files": True,
-             "description": "检索并筛选资料，把关键结论与出处整理进 research_notes.md。"},
-            {"agent_name": "coder", "instructions": "阅读 research_notes.md，并实现所要求的应用代码。", "pass_files": True,
-             "description": "依据研究笔记实现代码，把资料结论落到具体实现。"}
-        ],
-        "max_review_rounds": 1,
-        "icon": "📚",
-        "color": "#14b8a6"
     },
     {
         "name": "Spec & Build",
@@ -1156,11 +1085,11 @@ BUILTIN_HARNESSES = [
         ),
         "strategy": "sequential",
         "stages": [
-            {"agent_name": "product-manager", "instructions": "把用户需求拆成 PRD 与验收标准，写入 requirements.md。", "pass_files": True,
+            {"agent_name": "product-manager", "instructions": "把用户需求拆成 PRD 与验收标准，写入 requirements.md。",
              "description": "把需求拆成 PRD、用户故事与可验收标准（requirements.md）。"},
-            {"agent_name": "architect", "instructions": "阅读 requirements.md，给出模块划分与核心接口，写入 design.py。", "pass_files": True,
+            {"agent_name": "architect", "instructions": "阅读 requirements.md，给出模块划分与核心接口，写入 design.py。",
              "description": "依据 PRD 给出模块划分、依赖方向与核心接口（design.py）。"},
-            {"agent_name": "coder", "instructions": "按 requirements.md 与 design.py 实现完整方案。", "pass_files": True,
+            {"agent_name": "coder", "instructions": "按 requirements.md 与 design.py 实现完整方案。",
              "description": "按 PRD 与设计实现完整方案，逐条对齐验收标准。"}
         ],
         "max_review_rounds": 1,
@@ -1170,14 +1099,25 @@ BUILTIN_HARNESSES = [
 ]
 
 
+# 已下线的内置 harness（曾依赖联网工具）：启动同步时从库里移除旧记录
+RETIRED_BUILTIN_HARNESSES = ["Research & Write"]
+
+
 def sync_builtin_harnesses() -> None:
     """把内置 harness 模板同步进数据库，使模板升级能生效到已有记录。
 
     仅按名称覆盖同名记录；UI 目前不提供 harness 编辑入口，因此不存在覆盖用户自定义的风险。
+    已下线模板只在记录确实引用下线智能体时删除，避免误删用户自建的同名流水线。
     """
     for template in BUILTIN_HARNESSES:
         if HarnessStore.get(template["name"]) != template:
             HarnessStore.save(template)
+    for name in RETIRED_BUILTIN_HARNESSES:
+        record = HarnessStore.get(name)
+        if record and any(
+            stage.get("agent_name") == "researcher" for stage in record.get("stages", [])
+        ):
+            HarnessStore.delete(name)
 
 
 class HarnessEngine:
@@ -1203,20 +1143,33 @@ class HarnessEngine:
                         _emit_stream_event({
                             "type": "node", "node": stg["agent_name"], "round": 1, "phase": "start"})
                         agent = AgentFactory.get_agent(stg["agent_name"])
-                        prompt = _stage_prompt(stg["instructions"], _initial_task(state))
+                        task = _initial_task(state)
 
-                        # 判断是否向该阶段传递状态中的文件
-                        passed_files = state.get("files", {}) if stg.get("pass_files", True) else {}
+                        # 上游交接：除首条用户消息外，本策略的图里只有各阶段写回的
+                        # AIMessage，最后一条即上一个阶段的产出与工作说明。把它作为
+                        # 对话历史一起交给下一个智能体，下游才知道上一步做了什么、
+                        # 产物落在哪，而不是只能靠翻文件反推。
+                        upstream = next(
+                            (m for m in reversed(state.get("messages") or [])
+                             if isinstance(m, AIMessage)),
+                            None,
+                        )
+                        messages = []
+                        if task:
+                            messages.append(HumanMessage(content=f"本次任务（来自用户）：\n{task}"))
+                        if upstream is not None:
+                            messages.append(upstream)
+                        messages.append(
+                            HumanMessage(content=f"你的具体职责：\n{stg['instructions']}"))
 
-                        # 调用子智能体（流式执行，执行过程实时透出给 UI）
+                        # 调用子智能体（流式执行，执行过程实时透出给 UI）。
+                        # todos / execution_log 属于 harness 自身的编排状态，子智能体
+                        # 既不读也不写，不再传给它们。
                         result = stream_subagent(
                             agent,
                             {
-                                "messages": [HumanMessage(content=prompt)],
-                                "files": passed_files,
+                                "messages": messages,
                                 "workspace_id": workspace_of(state),
-                                "todos": state.get("todos", []),
-                                "execution_log": state.get("execution_log", []),
                             },
                             stg["agent_name"],
                             1,
@@ -1237,12 +1190,18 @@ class HarnessEngine:
                         _emit_stream_event({
                             "type": "node", "node": stg["agent_name"], "round": 1, "phase": "done"})
 
-                        # 输出状态更新
+                        # 输出状态更新：写回的 AIMessage 说清「本阶段做了什么」，
+                        # 下一个智能体直接读这条交接消息，不必从阶段指令反推成果
+                        reply = str(result["messages"][-1].content)
+                        duty = str(stg.get("description") or "").strip()
+                        handoff = (
+                            f"[{stg['agent_name']}] 我在本阶段完成了：{duty}\n\n{reply}"
+                            if duty
+                            else f"[{stg['agent_name']}] 我在本阶段完成的工作与产出如下：\n\n{reply}"
+                        )
                         return {
-                            "files": result.get("files", state.get("files", {})),
-                            "todos": result.get("todos", state.get("todos", [])),
                             "execution_log": logs,
-                            "messages": [AIMessage(content=f"[{stg['agent_name']}] {result['messages'][-1].content}")]
+                            "messages": [AIMessage(content=handoff)],
                         }
                     return node_fn
 
@@ -1254,7 +1213,7 @@ class HarnessEngine:
 
         elif strategy == "parallel":
             # 图结构：dispatcher 先拆解任务 → 各子智能体在独立进程/独立沙盒中并行执行
-            # → aggregator 做冲突检测、合并、写回 files 并生成最终回复。
+            # → aggregator 做冲突检测、合并目录改动并生成最终回复。
             def dispatcher_fn(state: DeepAgentState) -> dict:
                 _emit_stream_event({
                     "type": "node", "node": "dispatcher", "round": 1, "phase": "start"})
@@ -1272,6 +1231,11 @@ class HarnessEngine:
                     "type": "node", "node": "dispatcher", "round": 1, "phase": "done"})
                 return {
                     "tasks_to_dispatch": tasks,
+                    # 分发前留一份目录快照：汇总节点据此区分「本次改动」与历史文件
+                    "parallel_baseline": {
+                        rel: list(signature)
+                        for rel, signature in WorkspaceStore.scan_dir(workspace_of(state)).items()
+                    },
                     "execution_log": list(state.get("execution_log") or []) + [log_entry],
                 }
 
@@ -1328,7 +1292,7 @@ class HarnessEngine:
                                 "agent_name": stg["agent_name"],
                                 "instructions": task["instructions"],
                                 "summary": summary,
-                                "files": result.get("files") or {},
+                                "status": status,
                             }},
                             "messages": [AIMessage(content=f"[{stg['agent_name']}] {summary}")],
                             "execution_log": logs,
@@ -1371,10 +1335,7 @@ class HarnessEngine:
                         agent,
                         {
                             "messages": [HumanMessage(content=prompt)],
-                            "files": state.get("files", {}),
                             "workspace_id": workspace_of(state),
-                            "todos": state.get("todos", []),
-                            "execution_log": state.get("execution_log", []),
                         },
                         stg["agent_name"],
                         round_no,
@@ -1385,8 +1346,6 @@ class HarnessEngine:
                         "type": "node", "node": stg["agent_name"], "round": round_no,
                         "phase": "done"})
                     return {
-                        "files": result.get("files", state.get("files", {})),
-                        "todos": result.get("todos", state.get("todos", [])),
                         "messages": [AIMessage(content=f"[{stg['agent_name']}] {result['messages'][-1].content}")]
                     }
                 return creator_fn
@@ -1409,10 +1368,7 @@ class HarnessEngine:
                     agent,
                     {
                         "messages": [HumanMessage(content=_stage_prompt(reviewer["instructions"], _initial_task(state)))],
-                        "files": state.get("files", {}),
                         "workspace_id": workspace_of(state),
-                        "todos": state.get("todos", []),
-                        "execution_log": state.get("execution_log", []),
                     },
                     reviewer["agent_name"],
                     round_no,
@@ -1533,12 +1489,11 @@ class HarnessEngine:
                     result = stream_subagent(
                         AgentFactory.get_agent(stg["agent_name"]),
                         {
+                            # 讨论记录与主持人指示已由 _speaker_prompt 拼进提示词，
+                            # 无需再传 harness 的 todos / execution_log
                             "messages": [HumanMessage(
                                 content=_speaker_prompt(stg, state, participants, round_no))],
-                            "files": state.get("files", {}),
                             "workspace_id": workspace_of(state),
-                            "todos": state.get("todos", []),
-                            "execution_log": state.get("execution_log", []),
                         },
                         stg["agent_name"],
                         round_no,
@@ -1560,8 +1515,6 @@ class HarnessEngine:
                         "phase": "done"})
                     return {
                         # 发言是串行的，直接写共享工作区：后一位发言者能立即看到前一位的修改
-                        "files": result.get("files", state.get("files", {})),
-                        "todos": result.get("todos", state.get("todos", [])),
                         "messages": [AIMessage(content=f"[{stg['agent_name']}] {reply}")],
                         "execution_log": list(state.get("execution_log") or []) + [log_entry],
                     }
@@ -1646,8 +1599,25 @@ class HarnessEngine:
         final_state = init_state
         try:
             if config.get("strategy") == "parallel":
-                # parallel 图的节点是异步函数，必须走 astream 才能在同一 superstep 内并发执行
-                final_state = asyncio.run(_astream_graph(compiled_graph, init_state, sink))
+                # parallel 图的节点是异步函数，必须走 astream 才能在同一 superstep 内并发执行。
+                # 整条流水线（含分发与汇总的模型调用）再套一层总超时，避免模型卡死时无限等待。
+                total_timeout = float(config.get("timeout") or PARALLEL_TOTAL_TIMEOUT)
+                branch_count = max(1, len(config.get("stages") or []))
+                pool = ThreadPoolExecutor(
+                    max_workers=min(branch_count, 8),
+                    thread_name_prefix="harness-branch",
+                )
+                token = _parallel_pool.set(pool)
+                try:
+                    final_state = asyncio.run(asyncio.wait_for(
+                        _astream_graph(compiled_graph, init_state, sink),
+                        timeout=total_timeout,
+                    ))
+                finally:
+                    _parallel_pool.reset(token)
+                    # cancel_futures 丢掉还在排队的任务；已在跑的线程无法强杀，
+                    # wait=False 让它们跑完自行退出，不阻塞本次运行收尾
+                    pool.shutdown(wait=False, cancel_futures=True)
             else:
                 for mode, payload in compiled_graph.stream(
                     init_state,
@@ -1660,6 +1630,11 @@ class HarnessEngine:
                         final_state = payload
         except RunCancelled:
             # 用户终止：不再发结束事件，由调用方按「已取消」处理
+            raise
+        except asyncio.TimeoutError as e:
+            # 整条并行流水线超过总时限：明确告知超时，而不是落成泛化的执行错误
+            raw_sink({"type": "end", "harness": harness_name, "status": "error",
+                      "reason": f"timeout: {e or '超过总时限'}"})
             raise
         except Exception:
             # 这里用 raw_sink：真正的异常比取消标记更重要，不能被取消检查覆盖
@@ -1697,7 +1672,7 @@ def run_harness(
         task: 交给流水线的完整任务描述（目标、输入、期望产出）。
 
     Returns:
-        工具结果里是流水线的最终汇总答复；产出的文件会合并进当前项目的虚拟文件系统。
+        工具结果里是流水线的最终汇总答复；产出的文件会合并进当前项目的工作区。
     """
     config = HarnessStore.get(harness_name) or next(
         (h for h in BUILTIN_HARNESSES if h["name"] == harness_name), None
@@ -1711,9 +1686,7 @@ def run_harness(
 
     init_state = {
         "messages": [HumanMessage(content=task)],
-        "files": state.get("files", {}),
         "workspace_id": workspace_of(state),
-        "todos": state.get("todos", []),
         "execution_log": state.get("execution_log", []),
     }
     debug_log(
@@ -1747,8 +1720,6 @@ def run_harness(
     summary = str(replies[-1].content) if replies else "（流水线没有产生文本输出）"
     return Command(update={
         "messages": [ToolMessage(content=summary, tool_call_id=tool_call_id)],
-        "files": final_state.get("files", state.get("files", {})),
-        "todos": final_state.get("todos", state.get("todos", [])),
         "execution_log": final_state.get("execution_log", state.get("execution_log", [])),
     })
 

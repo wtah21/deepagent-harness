@@ -35,7 +35,6 @@ class HarnessStage(TypedDict):
     """多智能体 harness 流水线中的单个阶段。"""
     agent_name: str
     instructions: str
-    pass_files: bool
     description: str
 
 
@@ -71,15 +70,15 @@ class DispatchTask(TypedDict):
 
 
 class Proposal(TypedDict):
-    """单个子智能体在隔离沙盒中的产出。
+    """单个并行分支的执行结论。
 
-    子智能体不直接写 files，而是把新增/修改的文件内容放进这里，
-    由汇总节点统一做冲突检测、合并，再写回真正的工作区。
+    并行分支直接读写共享工作区（写同一路径由文件锁串行化），
+    这里只留结论摘要，供汇总节点生成最终答复。
     """
     agent_name: str
     instructions: str
     summary: str
-    files: dict[str, str]
+    status: str
 
 
 class ModeratorDecision(TypedDict):
@@ -98,27 +97,6 @@ class ModeratorDecision(TypedDict):
 
 
 # ── 状态通道的 Reducer 函数 ──────────────────────────────────────────
-
-def merge_files(left: dict[str, dict], right: dict[str, dict]) -> dict[str, dict]:
-    """Reducer：合并虚拟文件系统的索引更新，避免抛出 InvalidUpdateError。
-
-    files 里存的是索引（大小 / 哈希 / 更新时间），文件内容存在工作区表，
-    因此这里的合并开销与文件体积无关，也不会撑大检查点。
-    """
-    if left is None:
-        left = {}
-    if right is None:
-        return left
-    merged = dict(left)
-    for key, value in right.items():
-        # 值为 None 表示删除该文件索引：普通 dict.update 无法删除键，
-        # 侧边栏删除文件后索引会残留，因此这里显式处理删除语义
-        if value is None:
-            merged.pop(key, None)
-        else:
-            merged[key] = value
-    return merged
-
 
 def merge_todos(left: list[Todo], right: list[Todo]) -> list[Todo]:
     """待办列表的 Reducer，允许在单个步骤中被多次写入。"""
@@ -142,10 +120,7 @@ def merge_tasks_to_dispatch(left: list[DispatchTask], right: list[DispatchTask])
 
 
 def merge_proposals(left: dict[str, Proposal], right: dict[str, Proposal]) -> dict[str, Proposal]:
-    """提案的 Reducer：按 agent_name 合并，同一智能体多次提交时合并其文件变更。
-
-    并行分支在同一个 superstep 内各自写 proposals，必须用 reducer 合并而不是互相覆盖。
-    """
+    """提案的 Reducer：按 agent_name 合并，同一智能体多次提交时保留最新结论。"""
     if left is None:
         left = {}
     if right is None:
@@ -156,15 +131,19 @@ def merge_proposals(left: dict[str, Proposal], right: dict[str, Proposal]) -> di
         if not existing:
             merged[agent_name] = proposal
             continue
-        files = dict(existing.get("files") or {})
-        files.update(proposal.get("files") or {})
         merged[agent_name] = {
             "agent_name": agent_name,
             "instructions": proposal.get("instructions") or existing.get("instructions", ""),
             "summary": proposal.get("summary") or existing.get("summary", ""),
-            "files": files,
         }
     return merged
+
+
+def merge_baseline(left: dict[str, list[int]], right: dict[str, list[int]]) -> dict[str, list[int]]:
+    """目录基线的 Reducer：分发器整体覆盖上一轮的快照。"""
+    if right is not None:
+        return right
+    return left if left is not None else {}
 
 
 def merge_moderator_decision(left: ModeratorDecision, right: ModeratorDecision) -> ModeratorDecision:
@@ -180,16 +159,18 @@ class DeepAgentState(TypedDict):
     """整个 DeepAgent 系统的共享状态。"""
     messages: Annotated[Sequence[BaseMessage], add_messages]
     todos: Annotated[list[Todo], merge_todos]
-    # 虚拟文件系统的轻量索引：{path: {size, hash, updated_at}}，内容存在工作区表
-    files: Annotated[dict[str, dict], merge_files]
-    # 当前 project 的工作区标识（即 thread_id），同一工作区内的所有智能体共享文件
+    # 当前 project 的工作区标识（即 thread_id），同一工作区内的所有智能体共享文件。
+    # 文件本身只存在于磁盘（Docker 容器挂载的工作区目录），状态里不再维护任何文件索引。
     workspace_id: str
     remaining_steps: RemainingSteps
     execution_log: Annotated[list[ExecutionLogEntry], merge_execution_log]
     # parallel 策略：分发器拆解出的子任务清单，各子智能体只读取属于自己的那一条
     tasks_to_dispatch: Annotated[list[DispatchTask], merge_tasks_to_dispatch]
-    # parallel 策略：各子智能体在隔离沙盒中的产出，由汇总节点统一裁决后写回 files
+    # parallel 策略：各并行分支的执行结论，由汇总节点合成最终答复
     proposals: Annotated[dict[str, Proposal], merge_proposals]
+    # parallel 策略：分发前的目录快照（{path: [mtime_ns, size]}），
+    # 汇总节点据此识别本次运行真正新增/修改的文件
+    parallel_baseline: Annotated[dict[str, list[int]], merge_baseline]
     # brainstorming 策略：主持人最近一次决策（决定下一位发言人 / 是否终止会议）
     moderator_decision: Annotated[ModeratorDecision, merge_moderator_decision]
 

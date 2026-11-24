@@ -125,7 +125,7 @@ def _make_subagent_tool(agent_name: str, role: str) -> BaseTool:
             tool_call_id: Annotated[str, InjectedToolCallId],
             state: Annotated[dict, InjectedState],
         ) -> Command:
-        """调用子智能体并把它产出的文件、结论写回共享状态。"""
+        """调用子智能体并把它产出的结论写回共享状态。"""
         try:
             agent = AgentFactory.get_agent(agent_name)
         except ValueError as e:
@@ -138,7 +138,6 @@ def _make_subagent_tool(agent_name: str, role: str) -> BaseTool:
             result = agent.invoke(
                 {
                     "messages": [HumanMessage(content=instructions)],
-                    "files": state.get("files", {}),
                     "workspace_id": workspace_of(state),
                     "todos": state.get("todos", []),
                     "execution_log": state.get("execution_log", []),
@@ -174,7 +173,6 @@ def _make_subagent_tool(agent_name: str, role: str) -> BaseTool:
         current_logs.append(log_entry)
 
         return Command(update={
-            "files": result.get("files", state.get("files", {})),
             "todos": result.get("todos", state.get("todos", [])),
             "execution_log": current_logs,
             "messages": [ToolMessage(f"[{agent_name}] {final_reply}", tool_call_id=tool_call_id)],
@@ -197,6 +195,10 @@ def build_subagent_tools() -> list[BaseTool]:
 
 # ── 初始化 ────────────────────────────────────────────────────────────
 
+# 已下线的内置智能体（曾依赖联网工具）：启动同步时从库里清理旧记录
+RETIRED_BUILTIN_AGENTS = ["researcher"]
+
+
 def initialize_builtin_agents():
     """把内置智能体模板同步进数据库。
 
@@ -208,6 +210,10 @@ def initialize_builtin_agents():
         if existing is None or existing.get("is_builtin"):
             if existing != config:
                 AgentStore.save(config)
+    for name in RETIRED_BUILTIN_AGENTS:
+        existing = AgentStore.get(name)
+        if existing and existing.get("is_builtin"):
+            AgentStore.delete(name)
 
 
 # 执行数据库填充

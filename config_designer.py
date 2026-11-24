@@ -53,7 +53,6 @@ class HarnessStageDraft(BaseModel):
     description: str = Field(description=(
         "面向使用者的一句话节点职责说明（20-40 字），描述该节点在流程中做什么、"
         "向下一步交付什么，会展示在前端流程图的节点说明里；不要复述 instructions 全文"))
-    pass_files: bool = Field(default=True, description="是否把虚拟文件系统传给该阶段")
 
 
 class HarnessDraft(BaseModel):

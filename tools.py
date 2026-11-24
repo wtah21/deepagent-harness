@@ -1,6 +1,6 @@
 """
 DeepAgent Harness 的状态修改类与实用工具集。
-包含虚拟文件系统操作、子进程执行、网页搜索，
+包含工作区文件操作、子进程执行，
 以及基于 LangGraph Command 更新的状态管理工具。
 """
 import os
@@ -10,8 +10,6 @@ import subprocess
 import tempfile
 import difflib
 from typing import Annotated, Optional
-import urllib.request
-from bs4 import BeautifulSoup
 
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool, InjectedToolCallId
@@ -47,10 +45,12 @@ def ls(
     offset: int = 0,
     limit: int = 100,
 ) -> str:
-    """分页列出虚拟文件系统中的文件。默认返回第一页（最多 100 个）。
+    """分页列出当前工作区目录中的文件。默认返回第一页（最多 100 个）。
     文件很多时先用默认页，没找到目标再传 offset 翻页，不要一次拉取全部。
     """
-    files = sorted(state.get("files", {}).keys())
+    # 直接扫描工作区目录：文件实体只在磁盘上，状态里没有索引可以依赖
+    #（例如用户在工作目录里预置的文件、或其它进程刚写入的文件）
+    files = sorted(WorkspaceStore.scan_dir(workspace_of(state)).keys())
     total = len(files)
     if total == 0:
         return "(no files yet)"
@@ -76,8 +76,8 @@ def read_file(
     """
     content = WorkspaceStore.read(workspace_of(state), path)
     if content is None:
-        files = state.get("files", {})
-        return f"Error: '{path}' not found. Existing files: {list(files.keys())}"
+        files = sorted(WorkspaceStore.scan_dir(workspace_of(state)).keys())
+        return f"Error: '{path}' not found. Existing files: {files}"
 
     if max_lines and int(max_lines) > 0:
         lines = content.splitlines()
@@ -99,7 +99,7 @@ def write_file(
     tool_call_id: Annotated[str, InjectedToolCallId],
     state: Annotated[dict, InjectedState],
 ) -> Command:
-    """在虚拟文件系统中新建文件，或完全覆盖已有文件。"""
+    """在工作区中新建文件，或完全覆盖已有文件。"""
     # 子智能体可能给容器内绝对路径（/app/workspace/x.py、/reports/x.md），统一成工作区相对路径
     normalized = WorkspaceStore.normalize_path(path)
     if not normalized:
@@ -109,12 +109,10 @@ def write_file(
             tool_call_id=tool_call_id,
         )]})
     path = normalized
-    entry = WorkspaceStore.write(workspace_of(state), path, content)
-    # 只把索引写回 state，文件内容留在工作区表
+    WorkspaceStore.write(workspace_of(state), path, content)
     return Command(
         update={
-            "files": {path: entry},
-            "messages": [ToolMessage(f"Wrote {len(content)} chars to {path} in virtual filesystem.", tool_call_id=tool_call_id)],
+            "messages": [ToolMessage(f"Wrote {len(content)} chars to {path} in workspace.", tool_call_id=tool_call_id)],
         }
     )
 
@@ -139,29 +137,37 @@ def edit_file(
             tool_call_id=tool_call_id,
         )]})
     path = normalized
-    content = WorkspaceStore.read(workspace_id, path)
-    if content is None:
-        return Command(update={"messages": [ToolMessage(f"Error: '{path}' not found in virtual filesystem.", tool_call_id=tool_call_id)]})
+    # 读-校验-写必须整体持锁：并行分支同时编辑同一文件时，
+    # 只锁写入会让两个分支基于同一份旧内容各自替换，后写的覆盖前者
+    try:
+        with WorkspaceStore.write_lock(workspace_id, path):
+            content = WorkspaceStore.read(workspace_id, path)
+            if content is None:
+                return Command(update={"messages": [ToolMessage(f"Error: '{path}' not found in workspace.", tool_call_id=tool_call_id)]})
 
-    count = content.count(old_str)
-    if count != 1:
-        return Command(
-            update={
-                "messages": [
-                    ToolMessage(
-                        f"Error: old_str appears {count} times in {path}, must be exactly 1. "
-                        "Include more surrounding context to make it unique.",
-                        tool_call_id=tool_call_id,
-                    )
-                ]
-            }
-        )
+            count = content.count(old_str)
+            if count != 1:
+                return Command(
+                    update={
+                        "messages": [
+                            ToolMessage(
+                                f"Error: old_str appears {count} times in {path}, must be exactly 1. "
+                                "Include more surrounding context to make it unique.",
+                                tool_call_id=tool_call_id,
+                            )
+                        ]
+                    }
+                )
 
-    entry = WorkspaceStore.write(workspace_id, path, content.replace(old_str, new_str))
+            WorkspaceStore.write(workspace_id, path, content.replace(old_str, new_str))
+    except TimeoutError as e:
+        return Command(update={"messages": [ToolMessage(
+            f"Error: {e}。该文件正被其它并行分支写入，请稍后重试或改到自己的文件里。",
+            tool_call_id=tool_call_id,
+        )]})
     return Command(
         update={
-            "files": {path: entry},
-            "messages": [ToolMessage(f"Edited virtual file {path}", tool_call_id=tool_call_id)],
+            "messages": [ToolMessage(f"Edited {path} in workspace.", tool_call_id=tool_call_id)],
         }
     )
 
@@ -173,7 +179,7 @@ def read_from_disk(
     tool_call_id: Annotated[str, InjectedToolCallId],
     state: Annotated[dict, InjectedState],
 ) -> Command:
-    """从本地文件系统导入一个真实文件到虚拟文件系统。"""
+    """从本地文件系统导入一个真实文件到当前工作区。"""
     try:
         if not os.path.exists(real_path):
             return Command(update={"messages": [ToolMessage(f"Error: real path '{real_path}' does not exist.", tool_call_id=tool_call_id)]})
@@ -183,11 +189,10 @@ def read_from_disk(
 
         # 虚拟路径同样归一化，避免索引里出现容器内绝对路径
         virtual_path = WorkspaceStore.normalize_path(virtual_path) or virtual_path
-        entry = WorkspaceStore.write(workspace_of(state), virtual_path, content)
+        WorkspaceStore.write(workspace_of(state), virtual_path, content)
         return Command(
             update={
-                "files": {virtual_path: entry},
-                "messages": [ToolMessage(f"Imported '{real_path}' into virtual file '{virtual_path}'", tool_call_id=tool_call_id)]
+                "messages": [ToolMessage(f"Imported '{real_path}' into '{virtual_path}'", tool_call_id=tool_call_id)]
             }
         )
     except Exception as e:
@@ -238,7 +243,7 @@ _SANDBOX_MAX_FILES = 50              # 单次回收文件数上限
 
 
 def _seed_sandbox(workdir: str, seeded: dict) -> None:
-    """把虚拟文件系统的文件预置进本地回退沙盒目录（容器路径不需要预置）。"""
+    """把工作区文件预置进本地回退沙盒目录（容器路径不需要预置）。"""
     for vpath, content in seeded.items():
         dest = Path(workdir).joinpath(*vpath.split("/"))
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -249,8 +254,7 @@ def _seed_sandbox(workdir: str, seeded: dict) -> None:
 
 
 def _collect_sandbox(workdir: str, workspace_id: str, seeded: dict):
-    """扫描本地回退沙盒目录，把新增/修改的文件回收进虚拟文件系统。"""
-    entries: dict = {}
+    """扫描本地回退沙盒目录，把新增/修改的文件回收进工作区目录。"""
     collected: list[str] = []
     skipped: list[str] = []
     for root, dirs, names in os.walk(workdir):
@@ -270,12 +274,12 @@ def _collect_sandbox(workdir: str, workspace_id: str, seeded: dict):
                 continue
             if rel in seeded and seeded[rel] == content:
                 continue  # 内容未变的预置文件，无需回收
-            entries[rel] = WorkspaceStore.write(workspace_id, rel, content)
+            WorkspaceStore.write(workspace_id, rel, content)
             collected.append(rel)
             if len(collected) >= _SANDBOX_MAX_FILES:
                 skipped.append("... (更多文件超出单次回收上限)")
-                return entries, collected, skipped
-    return entries, collected, skipped
+                return collected, skipped
+    return collected, skipped
 
 
 def _run_local_sandboxed(
@@ -283,7 +287,7 @@ def _run_local_sandboxed(
     tool_call_id: str,
     run_fn,
 ) -> Command:
-    """本地回退沙盒执行器：隔离临时目录 + 虚拟文件预置 + 产物回收。
+    """本地回退沙盒执行器：隔离临时目录 + 工作区文件预置 + 产物回收。
 
     仅在 Docker 不可用时使用；正常路径是容器内直接读写挂载的工作区目录。
     """
@@ -293,14 +297,13 @@ def _run_local_sandboxed(
         seeded = WorkspaceStore.read_all(workspace_id)
         _seed_sandbox(workdir, seeded)
         output = run_fn(workdir)
-        entries, collected, skipped = _collect_sandbox(workdir, workspace_id, seeded)
+        collected, skipped = _collect_sandbox(workdir, workspace_id, seeded)
         if collected:
-            output += "\n\n[Collected into virtual filesystem]: " + ", ".join(collected)
+            output += "\n\n[Collected into workspace]: " + ", ".join(collected)
         if skipped:
             output += "\n[Skipped]: " + ", ".join(skipped)
         return Command(
             update={
-                "files": entries,
                 "messages": [ToolMessage(output, tool_call_id=tool_call_id)],
             }
         )
@@ -331,12 +334,11 @@ def _run_execution_tool(
         except docker_runtime.DockerError as e:
             output = None  # 容器故障：回退本地沙盒
         else:
-            entries, changed = WorkspaceStore.sync_dir(workspace_id, before)
+            _, changed = WorkspaceStore.sync_dir(workspace_id, before)
             if changed:
-                output += "\n\n[Collected into workspace]: " + ", ".join(changed)
+                output += "\n\n[Changed in workspace]: " + ", ".join(changed)
             return Command(
                 update={
-                    "files": entries,
                     "messages": [ToolMessage(output, tool_call_id=tool_call_id)],
                 }
             )
@@ -367,7 +369,7 @@ def execute_python(
 ) -> Command:
     """在 Docker 隔离容器中运行一段独立的 Python 代码，并返回 stdout/stderr。
     每个项目的容器限制为 1 CPU / 1GB 内存，工作区目录挂载为容器内的 /app/workspace：
-    代码可直接读取之前生成的文件；新产生的文件会自动登记进虚拟文件系统索引。
+    代码可直接读取之前生成的文件；新产生的文件直接留在工作区目录中。
     容器不可用时自动回退到临时沙盒目录执行。常用于验证代码是否正确。
     """
     return _run_execution_tool(state, tool_call_id, code, is_shell=False)
@@ -381,7 +383,7 @@ def shell_command(
 ) -> Command:
     """在 Docker 隔离容器中执行 shell 命令，需要谨慎使用。
     每个项目的容器限制为 1 CPU / 1GB 内存，工作区目录挂载为容器内的 /app/workspace：
-    命令产生的新文件会自动登记进虚拟文件系统索引。
+    命令直接作用于挂载的工作区目录，新增与修改的文件会作为提示返回。
     容器不可用时自动回退到临时沙盒目录执行。
     """
     return _run_execution_tool(state, tool_call_id, command, is_shell=True)
@@ -402,59 +404,6 @@ def install_package(package: str) -> str:
     except Exception as e:
         return f"Error installing package: {str(e)}"
 
-
-# ── 网络与搜索工具 ───────────────────────────────────────────────────
-
-@tool
-def web_search(query: str, max_results: int = 5) -> str:
-    """使用 DuckDuckGo 进行网页搜索，返回匹配结果的摘要。默认返回前 5 条，
-    需要更多时最多调到 20 条，避免一次拉取过多结果占用上下文。
-    """
-    try:
-        from duckduckgo_search import DDGS
-        limit = max(1, min(int(max_results), 20))
-        results_str = []
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=limit))
-            for i, r in enumerate(results, 1):
-                results_str.append(f"{i}. Title: {r.get('title')}\n   URL: {r.get('href')}\n   Snippet: {r.get('body')}\n")
-        return "\n".join(results_str) if results_str else "No results found."
-    except Exception as e:
-        # 库调用失败时的兜底处理
-        return f"Web search error: {str(e)}. Try using python to search or scrape."
-
-
-@tool
-def read_url(url: str, max_chars: int = 5000) -> str:
-    """抓取某个公开 URL 的文本内容并返回（已去除 HTML 标签）。
-    默认最多返回 5000 字符；内容很长时先读默认长度，需要更多再调大 max_chars。
-    """
-    try:
-        req = urllib.request.Request(
-            url, 
-            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-        )
-        with urllib.request.urlopen(req, timeout=10) as response:
-            html = response.read()
-        soup = BeautifulSoup(html, 'html.parser')
-        
-        # 移除 script 和 style 元素
-        for script in soup(["script", "style"]):
-            script.decompose()
-            
-        text = soup.get_text()
-        
-        # 按行拆分，并去掉每行首尾的空白字符
-        lines = (line.strip() for line in text.splitlines())
-        # 把多行标题拆分为逐行内容
-        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-        # 丢弃空行
-        text_content = '\n'.join(chunk for chunk in chunks if chunk)
-        
-        limit = max(500, min(int(max_chars), 20000))
-        return text_content[:limit] + (f"\n... [Truncated to {limit} chars]" if len(text_content) > limit else "")
-    except Exception as e:
-        return f"Error fetching URL: {str(e)}"
 
 # 为避免 Path 的循环导入问题，将其放在文件末尾导入
 from pathlib import Path

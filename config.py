@@ -32,6 +32,8 @@ DOCKER_IMAGE = os.getenv("DOCKER_IMAGE", "python:3.11-slim")
 DOCKER_CPUS = "1.0"
 DOCKER_MEMORY = "1g"
 CONTAINER_PREFIX = "harness_ws_"
+# 容器网络模式：强制断网，容器内代码无法访问外部网络
+DOCKER_NETWORK = "none"
 
 
 # ── 调试日志（临时排查用）─────────────────────────────────────
@@ -97,7 +99,11 @@ TOOL_OUTPUT_FILTER_TIMEOUT = int(os.getenv("TOOL_OUTPUT_FILTER_TIMEOUT", "30"))
 
 # ── 智能体默认配置 ────────────────────────────────────────────
 DEFAULT_RECURSION_LIMIT = 200
-DEFAULT_TOOLS = ["ls", "read_file", "write_file", "edit_file", "execute_python", "write_todos"]
+# 主智能体的核心工具：始终注入，不参与语义检索
+CORE_TOOLS = [
+    "ls", "read_file", "write_file", "edit_file", "diff_files", "read_from_disk",
+    "execute_python", "shell_command", "install_package", "write_todos",
+]
 # 子智能体（ReAct 循环）专用递归上限。子图与外层 harness 图各自独立计数，
 # 而 ReAct 每轮"模型节点→工具节点"消耗 2 个超步：200 步只够约 100 次工具调用。
 # 实测 Spec & Build 的 coder 单 stage 写 21 个文件（约 130KB 代码）就用满了 200 步
@@ -109,6 +115,45 @@ DANGEROUS_TOOLS = ["shell_command", "install_package"]
 EXECUTION_TIMEOUT = 30
 MAX_OUTPUT_LENGTH = 5000
 
+# ── 并行策略 ──────────────────────────────────────────────────
+# 并行分支共享同一工作区目录，同一文件的写锁最长等待时间（秒）。
+# 超时即放弃写入并报错，避免一个卡死的分支把其它分支一起拖住。
+FILE_LOCK_TIMEOUT = int(os.getenv("FILE_LOCK_TIMEOUT", "30"))
+# 单个并行分支的执行上限（秒）。超时后置位该分支的取消标记。
+PARALLEL_STAGE_TIMEOUT = int(os.getenv("PARALLEL_STAGE_TIMEOUT", "1800"))
+# 整条并行流水线的上限（秒），含分发与汇总的模型调用。
+PARALLEL_TOTAL_TIMEOUT = int(os.getenv("PARALLEL_TOTAL_TIMEOUT", "7200"))
+
+# ── 工具语义检索（Milvus 混合检索 + 重排）──────────────────────
+# 工具总数不超过该值时全量注入，超过则改为「常驻工具 + 检索工具」
+TOOL_SEARCH_THRESHOLD = int(os.getenv("TOOL_SEARCH_THRESHOLD", "20"))
+# 每次检索返回给模型的工具数（候选只有十几个，再多会稀释提示词）
+TOOL_SEARCH_TOP_K = int(os.getenv("TOOL_SEARCH_TOP_K", "5"))
+# 混合检索的每路召回数（进入重排前的候选量；候选越少重排越快）
+TOOL_SEARCH_CANDIDATES = int(os.getenv("TOOL_SEARCH_CANDIDATES", "12"))
+# 是否启用基于对话上下文的查询改写
+TOOL_SEARCH_REWRITE = os.getenv("TOOL_SEARCH_REWRITE", "1") == "1"
+# Milvus（Zilliz Cloud）连接
+MILVUS_URL = os.getenv("Mivilus_URL", "").strip().strip('"').strip("'")
+MILVUS_TOKEN = os.getenv("Mivilus_API_KEY", "").strip().strip('"').strip("'")
+MILVUS_COLLECTION = os.getenv("MILVUS_COLLECTION", "harness_tools")
+# 硅基流动 embedding
+EMBEDDING_BASE_URL = os.getenv("SiliconEmbedding_BASE_URL", "https://api.siliconflow.cn/v1").rstrip("/")
+EMBEDDING_API_KEY = os.getenv("SiliconEmbedding_API_KEY", "").strip().strip('"').strip("'")
+EMBEDDING_MODEL = os.getenv("SiliconEmbedding_MODEL", "BAAI/bge-m3")
+EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1024"))
+# 本地重排模型（bge-reranker-v2-m3，CrossEncoder）
+RERANK_MODEL_PATH = os.getenv("RERANK_MODEL_PATH", r"E:\trae\model\bge-reranker-v2-m3")
+# auto：有 CUDA 用 GPU，否则 CPU
+RERANK_DEVICE = os.getenv("RERANK_DEVICE", "auto")
+# 工具描述很短，256 足够；这是重排延迟影响最大的参数
+RERANK_MAX_LENGTH = int(os.getenv("RERANK_MAX_LENGTH", "256"))
+RERANK_BATCH_SIZE = int(os.getenv("RERANK_BATCH_SIZE", "16"))
+# 启动后后台预热模型，避免第一次检索等待加载
+RERANK_WARMUP = os.getenv("RERANK_WARMUP", "1") == "1"
+# 工具索引的本地签名缓存：只有描述变化时才重新向量化
+TOOL_INDEX_CACHE_PATH = DATA_DIR / "tool_index.json"
+
 # ── UI 配置 ───────────────────────────────────────────────────
 APP_NAME = "DeepAgent Harness"
 APP_ICON = "\U0001f9e0"
@@ -118,7 +163,6 @@ APP_VERSION = "1.0.0"
 TOOL_CATEGORIES = {
     "filesystem": {"icon": "\U0001f4c1", "label": "Filesystem", "description": "Read, write, and manage virtual files"},
     "execution": {"icon": "\u26a1", "label": "Code Execution", "description": "Run code and shell commands"},
-    "web": {"icon": "\U0001f310", "label": "Web & Search", "description": "Search the web and fetch URLs"},
     "planning": {"icon": "\U0001f4cb", "label": "Planning", "description": "Task planning and tracking"},
     "delegation": {"icon": "\U0001f916", "label": "Delegation", "description": "Delegate to other agents"},
     "meta": {"icon": "\U0001f527", "label": "Meta", "description": "Create agents and harnesses"},
